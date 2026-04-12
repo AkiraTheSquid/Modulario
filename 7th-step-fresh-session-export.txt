@@ -1,0 +1,230 @@
+MODULARIO — Step 7: Fresh Session Context Export
+Turning Modulario's structural snapshot into a session-start prompt that bypasses context decay
+===========================================================================================
+
+EMPIRICAL BASIS
+---------------
+Ease: 85 / 100   Impact: 70 / 100
+
+Claude Code's official best practices documentation states explicitly: "A clean session with
+a better prompt almost always outperforms a long session with accumulated corrections."
+
+A confirmed GitHub issue (anthropics/claude-code#5311) documents Claude Code violating
+CLAUDE.md instructions in long sessions — specifically occurring after context summarization,
+where quality requirements were treated as lower priority than task completion.
+
+The Sourcegraph engineering team found quality degradation beginning around 147,000–152,000
+tokens — well before the advertised 200K context limit. A systematic test of hook-based
+context injection achieved 108/108 consistency across 15 files with no performance decline
+from file 1 to file 15. The contrast is stark: CLAUDE.md degrades; PostToolUse does not.
+
+Step 7's impact ceiling is 70 (not 90) because it addresses session reliability, not
+structural debt itself. It makes Claude behave better in that session. It does not prevent
+the underlying coupling/size problems from accumulating — that is what Steps 4–6 do.
+
+But it is the easiest high-leverage addition remaining: all the data already exists in
+state.json, churn.json (Step 5), and coupling.json (Step 6). Step 7 is primarily a new
+output format, not new analysis.
+
+
+--------------------------------------------------------------------------------------------
+THE PROBLEM IT SOLVES
+--------------------------------------------------------------------------------------------
+
+You currently have two ways to give Claude structural context:
+
+  1. CLAUDE.md (global instructions at session start)
+     Problem: degrades in long sessions. Context summarization treats these as lower-priority
+     than task completion. After the session compacts, the rules are partially forgotten.
+
+  2. PostToolUse hook (injected after each write)
+     Problem: it tells Claude the current file's status AFTER the write. It does not give
+     Claude a picture of the whole project's structural state BEFORE it starts a task.
+
+Step 7 fills the gap between these two: a compact, structured context payload you paste
+at the START of a fresh session. It is not CLAUDE.md — it is not persistent or global.
+It is a per-session, per-project briefing generated from real current data.
+
+The PostToolUse hook then maintains that context as Claude works, reinforcing the rules
+at each write rather than relying on Claude to remember them from the session start.
+
+
+--------------------------------------------------------------------------------------------
+WHAT THE FRESH SESSION EXPORT CONTAINS
+--------------------------------------------------------------------------------------------
+
+A compact plain-text block, under 30 lines, suitable for pasting as the first message
+in a new Claude Code session or as context in a CLAUDE.md session override.
+
+Example output for Delta-Note-Local:
+
+  ── Modulario session context: Delta-Note-Local ──────────────────────────────
+  Generated: 2026-03-25 22:00  |  190 files  |  Last session: 2026-03-25 21:58
+
+  STRUCTURAL RULES FOR THIS SESSION
+  Do not add LOC or DEPS to files marked RED or ORANGE without proposing a split first.
+  If Modulario reports a VIOLATION after a write, fix it before continuing.
+  Prefer modifying the smallest file that correctly owns the change.
+
+  RED files — highest structural debt (avoid adding to these):
+    web_main_window.py        LOC:654   DEPS:4    (stable)
+    section_card.py           LOC:405   DEPS:12   (HIGH churn — 7 of last 20 sessions)
+    week.js                   LOC:531   DEPS:14   (co-changes with week_goals.js 71%)
+    window.py                 LOC:432   DEPS:11   (CRITICAL coupling: also touches editor.py)
+    weekly_goal_children_mode.js  LOC:826  DEPS:6
+
+  ORANGE files — elevated risk (be cautious):
+    goal_alignment.py  router.js  electron_backend.py  (+7 others)
+
+  BOUNDARY VIOLATIONS (must fix before adding features):
+    None currently detected.
+
+  STRONG change coupling pairs (always check the paired file):
+    window.py ↔ editor.py  (82% co-change)
+    week.js ↔ week_goals.js  (71% co-change)
+  ─────────────────────────────────────────────────────────────────────────────
+
+This is different from the existing 'c' key output (full TUI dump with all 190 files).
+The fresh session export is curated: only RED files, top ORANGE files, active violations,
+and strong coupling pairs. Under 30 lines. Designed to fit in a session-start message
+without consuming significant context budget.
+
+
+--------------------------------------------------------------------------------------------
+HOW IT IS GENERATED
+--------------------------------------------------------------------------------------------
+
+New command: mod export  (or a key press in the TUI, suggested: 'x')
+
+  mod export                    → prints to stdout
+  mod export --copy             → copies to clipboard (uses xclip, same as 'c' key)
+  mod export --file prompt.txt  → writes to a file for reuse
+
+The export reads:
+  state/<hash>.json       for RED/ORANGE file list and current LOC/DEPS
+  churn.json              for HIGH/CRITICAL churn annotations (Step 5)
+  coupling.json           for STRONG/CRITICAL coupling pair annotations (Step 6)
+  violations (in state)   for active boundary violations (Step 4)
+
+Steps 4–6 are not required. If churn.json or coupling.json don't exist, those sections
+are omitted from the export. The export degrades gracefully to just RED/ORANGE files
+if only the base analyzer is available.
+
+
+--------------------------------------------------------------------------------------------
+THE FRESH SESSION WORKFLOW
+--------------------------------------------------------------------------------------------
+
+Before starting a Claude Code session on a project:
+
+  1. Run: mod export --copy   (or press 'x' in the TUI)
+  2. Start a new Claude Code session
+  3. Paste the export as your first message, followed by your task description
+
+Example first message:
+
+  [paste Modulario export here]
+
+  Task: add a new "archive goal" button to the daily goals panel. The button should
+  appear on each goal row and move the goal to an archived state without deleting it.
+
+Claude now knows before writing a single file: which files are red, which have unstable
+interfaces, which always change together. The PostToolUse hook then reinforces this
+at each write. The two mechanisms together — session-start briefing plus per-write
+injection — provide the strongest evidence-supported intervention available without
+modifying Claude Code itself.
+
+
+--------------------------------------------------------------------------------------------
+AUTOMATIC FRESH SESSION PROMPT (OPTIONAL EXTENSION)
+--------------------------------------------------------------------------------------------
+
+A more automated version: add the fresh session export to a per-project CLAUDE.md
+that mod regenerates each time the analyzer runs.
+
+  ~/.claude/projects/<project-hash>/CLAUDE.md  (Claude Code's per-project instruction file)
+
+mod would write a fresh CLAUDE.md after each analysis run, replacing the structural
+state section with current RED/ORANGE/violation data. The static rules (don't add to RED
+files, fix violations before continuing) stay fixed at the top. The dynamic data (current
+RED file list) is updated by the analyzer.
+
+This is the closest equivalent to what the LMPL paper's Rubric DSL does: a "semantic
+contract layer" that is always current and always visible to Claude at session start.
+
+Caveat: CLAUDE.md is still subject to context decay in long sessions. The PostToolUse
+hook remains the more reliable enforcement mechanism. The auto-CLAUDE.md approach is
+additive, not a replacement.
+
+
+--------------------------------------------------------------------------------------------
+WHAT THIS DOES NOT DO
+--------------------------------------------------------------------------------------------
+
+- Does not fix structural debt — it communicates it. The RED files are still RED after
+  the export. The export helps Claude avoid making them worse, not make them better.
+- Does not prevent context decay within a session. The hook handles that.
+  The fresh session export is for the START of a session, not the middle.
+- Does not replace the TUI. The TUI remains the human's real-time monitoring dashboard.
+  The export is a snapshot for Claude, not a replacement for your own situational awareness.
+- Does not enforce rules. It is advisory context, not a blocking mechanism.
+  Blocking comes from Step 4 (boundary violations, exit code 2).
+
+
+--------------------------------------------------------------------------------------------
+CHANGES TO EXISTING FILES
+--------------------------------------------------------------------------------------------
+
+mod CLI (bin/modulario and ~/.local/bin/mod)
+  - Add 'export' subcommand: mod export [--copy] [--file path]
+  - Reads state, churn, coupling, violations
+  - Formats and outputs the fresh session block
+  - Graceful degradation if churn.json/coupling.json don't exist yet
+
+modulario-tui.py
+  - Add 'x' key: generate fresh session export and copy to clipboard
+  - Show flash message: "Session context copied — paste at start of new Claude session"
+  - (The existing 'c' key keeps its behavior: full TUI dump)
+
+modulario-analyze.py (optional CLAUDE.md auto-update extension)
+  - After writing state.json, optionally regenerate the per-project CLAUDE.md
+  - Controlled by a flag in thresholds.json: "auto_update_claude_md": false
+  - Default off — enable deliberately per project
+
+
+--------------------------------------------------------------------------------------------
+BUILD ORDER
+--------------------------------------------------------------------------------------------
+
+Steps 4, 5, and 6 are not required before building Step 7. The export degrades gracefully.
+Step 7 can be built immediately after Step 3 if desired — it only needs state.json.
+The full value (with churn and coupling annotations) comes after Steps 5 and 6 have data.
+
+Step 1: Implement mod export in the CLI
+  Read state/<hash>.json (find via current-target.txt → hash → state path).
+  Format the RED/ORANGE section. Print to stdout.
+  Test: run mod export against Delta-Note-Local. Does the output look right?
+
+Step 2: Add --copy flag
+  Pipe to xclip -selection clipboard (same mechanism as the TUI's 'c' key).
+  Test: mod export --copy, then paste — confirm clipboard content is correct.
+
+Step 3: Add 'x' key to the TUI
+  Call the same export logic from within the TUI.
+  Show flash message on copy.
+
+Step 4: Add churn annotations (requires Step 5 data)
+  Load churn.json if it exists. For each RED file in the export, append churn status
+  if HIGH or CRITICAL. Skip silently if churn.json doesn't exist.
+
+Step 5: Add coupling annotations (requires Step 6 data)
+  Load coupling.json if it exists. Add STRONG/CRITICAL pairs section to export.
+  Skip silently if coupling.json doesn't exist.
+
+Step 6: Test the full workflow end-to-end
+  Run mod export --copy. Start a fresh Claude Code session. Paste as first message.
+  Give Claude a task that involves RED files. Observe whether it:
+    (a) acknowledges the structural constraints
+    (b) avoids adding LOC/DEPS to RED files
+    (c) checks coupling pairs when touching a coupled file
+  Note what it ignores. That gap informs whether the format needs adjustment.

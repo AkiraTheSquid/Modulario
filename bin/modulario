@@ -1,0 +1,816 @@
+#!/usr/bin/env python3
+"""
+mod — structural health monitor
+
+  mod <directory>         Analyze directory, activate Claude hook, show live TUI
+  mod query <directory>   CLI-only analysis — no TUI (for Claude agent use)
+  mod churn ...           Per-file churn warning controls
+  mod doc ...             Auto folder documentation
+  mod off                 Clear current target (disable hook)
+  mod help                Show this help
+"""
+import hashlib
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+from datetime import datetime
+from pathlib import Path
+
+MODULARIO_DIR    = Path(__file__).resolve().parent.parent
+ANALYZER         = MODULARIO_DIR / 'scripts' / 'modulario-analyze.py'
+THRESHOLDS       = MODULARIO_DIR / 'configs' / 'thresholds.json'
+TUI              = MODULARIO_DIR / 'tui' / 'modulario-tui.py'
+HOOK_SCRIPT      = MODULARIO_DIR / 'scripts' / 'modulario-hook.sh'
+STATE_DIR        = MODULARIO_DIR / 'data' / 'state'
+CURRENT_TARGET   = MODULARIO_DIR / 'configs' / 'current-target.txt'
+GLOBAL_SETTINGS  = Path.home() / '.claude' / 'settings.json'
+CODEX_HOOKS      = Path.home() / '.codex' / 'hooks.json'
+
+
+def state_path_for(target_dir):
+    h = hashlib.md5(os.path.realpath(target_dir).encode()).hexdigest()[:12]
+    return STATE_DIR / f'{h}.json'
+
+
+
+
+def ensure_global_hook():
+    """Write the global Claude hook entry into ~/.claude/settings.json once."""
+    hook_cmd = str(HOOK_SCRIPT)
+    GLOBAL_SETTINGS.parent.mkdir(parents=True, exist_ok=True)
+
+    settings = {}
+    if GLOBAL_SETTINGS.exists():
+        try:
+            with open(GLOBAL_SETTINGS) as f:
+                settings = json.load(f)
+        except Exception:
+            pass
+
+    hooks = settings.setdefault('hooks', {})
+    post_hooks = hooks.setdefault('PostToolUse', [])
+    if not any(any(h.get('command') == hook_cmd for h in e.get('hooks', [])) for e in post_hooks):
+        post_hooks.append({
+            'matcher': 'Write|Edit|NotebookEdit',
+            'hooks': [{'type': 'command', 'command': hook_cmd}],
+        })
+
+    with open(GLOBAL_SETTINGS, 'w') as f:
+        json.dump(settings, f, indent=2)
+        f.write('\n')
+
+
+def ensure_codex_hook():
+    """Write the global Codex hook entry into ~/.codex/hooks.json once."""
+    hook_cmd = str(HOOK_SCRIPT)
+    CODEX_HOOKS.parent.mkdir(parents=True, exist_ok=True)
+
+    settings = {}
+    if CODEX_HOOKS.exists():
+        try:
+            with open(CODEX_HOOKS) as f:
+                settings = json.load(f)
+        except Exception:
+            pass
+
+    hooks = settings.setdefault('hooks', {})
+    post_hooks = hooks.setdefault('PostToolUse', [])
+    if not any(any(h.get('command') == hook_cmd for h in e.get('hooks', [])) for e in post_hooks):
+        post_hooks.append({
+            'matcher': 'Write|Edit|NotebookEdit',
+            'hooks': [{'type': 'command', 'command': hook_cmd, 'timeout': 20}],
+        })
+
+    with open(CODEX_HOOKS, 'w') as f:
+        json.dump(settings, f, indent=2)
+        f.write('\n')
+
+
+def set_current_target(target):
+    CURRENT_TARGET.parent.mkdir(parents=True, exist_ok=True)
+    CURRENT_TARGET.write_text(target + '\n')
+
+
+def run_analyzer(target, sp):
+    return subprocess.run(
+        [sys.executable, str(ANALYZER),
+         '--target', target,
+         '--output', str(sp),
+         '--thresholds', str(THRESHOLDS)],
+        capture_output=True, text=True,
+    )
+
+
+def load_thresholds_config():
+    if THRESHOLDS.exists():
+        try:
+            with open(THRESHOLDS) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def save_thresholds_config(data):
+    THRESHOLDS.parent.mkdir(parents=True, exist_ok=True)
+    with open(THRESHOLDS, 'w') as f:
+        json.dump(data, f, indent=2)
+        f.write('\n')
+
+
+def active_target_dir():
+    if not CURRENT_TARGET.exists():
+        print("No active target. Run `mod <directory>` first.")
+        sys.exit(1)
+    target = CURRENT_TARGET.read_text().strip()
+    if not target or not os.path.isdir(target):
+        print("Current target is missing or invalid. Run `mod <directory>` again.")
+        sys.exit(1)
+    return os.path.realpath(target)
+
+
+def resolve_target_file(file_arg):
+    target = active_target_dir()
+    file_path = os.path.realpath(os.path.expanduser(file_arg))
+    if not os.path.isabs(file_arg):
+        file_path = os.path.realpath(os.path.join(target, file_arg))
+    if not os.path.isfile(file_path):
+        print(f"Not a file: {file_arg}")
+        sys.exit(1)
+    try:
+        rel_path = os.path.relpath(file_path, target)
+    except ValueError:
+        print(f"File is outside current target: {file_path}")
+        sys.exit(1)
+    if rel_path.startswith('..' + os.sep) or rel_path == '..':
+        print(f"File is outside current target: {file_path}")
+        sys.exit(1)
+    return target, rel_path
+
+
+def resolve_target_folder(folder_arg):
+    target = active_target_dir()
+    raw = folder_arg.strip()
+    if raw in ('/', '.'):
+        return target, '/'
+
+    candidate = os.path.realpath(os.path.join(target, os.path.expanduser(raw)))
+    if os.path.isfile(candidate):
+        candidate = os.path.dirname(candidate)
+    if not os.path.isdir(candidate):
+        print(f"Not a folder: {folder_arg}")
+        sys.exit(1)
+
+    try:
+        rel_path = os.path.relpath(candidate, target)
+    except ValueError:
+        print(f"Folder is outside current target: {candidate}")
+        sys.exit(1)
+    if rel_path.startswith('..' + os.sep) or rel_path == '..':
+        print(f"Folder is outside current target: {candidate}")
+        sys.exit(1)
+    if rel_path == '.':
+        return target, '/'
+    return target, rel_path.rstrip('/') + '/'
+
+
+
+def cmd_churn(argv):
+    parser = argparse.ArgumentParser(prog='mod churn', add_help=True)
+    subparsers = parser.add_subparsers(dest='churn_cmd', required=True)
+
+    p_disable = subparsers.add_parser('disable', help='Disable churn warnings for one file')
+    p_disable.add_argument('file')
+
+    p_raise = subparsers.add_parser('raise', help='Raise churn thresholds for one file')
+    p_raise.add_argument('file')
+    p_raise.add_argument('--high', type=float, required=True, help='New HIGH churn score threshold')
+    p_raise.add_argument('--critical', type=float, help='New CRITICAL churn score threshold')
+
+    p_enable = subparsers.add_parser('enable', help='Re-enable churn warnings for one file')
+    p_enable.add_argument('file')
+
+    p_show = subparsers.add_parser('show', help='Show file-specific churn rules')
+
+    args = parser.parse_args(argv)
+    data = load_thresholds_config()
+    rules = data.setdefault('churn_file_rules', {})
+
+    if args.churn_cmd == 'show':
+        if not rules:
+            print("No file-specific churn rules.")
+            return
+        print("File-specific churn rules:")
+        for path in sorted(rules):
+            print(f"  {path}: {rules[path]}")
+        return
+
+    _, rel_path = resolve_target_file(args.file)
+
+    if args.churn_cmd == 'disable':
+        rules[rel_path] = {'disabled': True}
+        save_thresholds_config(data)
+        print(f"Disabled churn warnings for {rel_path}")
+        return
+
+    if args.churn_cmd == 'enable':
+        if rel_path in rules:
+            del rules[rel_path]
+            save_thresholds_config(data)
+            print(f"Removed churn override for {rel_path}")
+        else:
+            print(f"No churn override exists for {rel_path}")
+        return
+
+    if args.churn_cmd == 'raise':
+        if args.high <= 0:
+            print("--high must be > 0")
+            sys.exit(1)
+        critical = args.critical if args.critical is not None else max(args.high + 1, args.high * 1.5)
+        if critical <= args.high:
+            print("--critical must be greater than --high")
+            sys.exit(1)
+        rules[rel_path] = {
+            'disabled': False,
+            'high': args.high,
+            'critical': critical,
+        }
+        save_thresholds_config(data)
+        print(f"Raised churn thresholds for {rel_path}: high={args.high}, critical={critical}")
+        return
+
+
+
+def cmd_launch(target_dir):
+    target = os.path.realpath(os.path.expanduser(target_dir))
+    if not os.path.isdir(target):
+        print(f"Not a directory: {target}")
+        sys.exit(1)
+
+    sp = state_path_for(target)
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    set_current_target(target)
+    ensure_global_hook()
+    ensure_codex_hook()
+
+    print(f"Analyzing {target} ...", end=' ', flush=True)
+    result = run_analyzer(target, sp)
+    if result.stderr:
+        print(result.stderr.strip())
+    else:
+        print()
+
+    os.execv(sys.executable, [sys.executable, str(TUI), '--state', str(sp)])
+
+
+def cmd_query(target_dir):
+    """CLI-only analysis — prints structured report, no TUI.  Used by Claude agent."""
+    target = os.path.realpath(os.path.expanduser(target_dir))
+    if not os.path.isdir(target):
+        print(f"Not a directory: {target}")
+        sys.exit(1)
+
+    sp = state_path_for(target)
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    set_current_target(target)
+    ensure_global_hook()
+    ensure_codex_hook()
+
+    result = run_analyzer(target, sp)
+    if result.returncode != 0 and result.stderr:
+        print(f"Analyzer error: {result.stderr.strip()}")
+        sys.exit(1)
+
+    with open(sp) as f:
+        state = json.load(f)
+
+    summary    = state['summary']
+    files      = state['files']
+    violations = state.get('violations', {})
+
+    # ── Header ────────────────────────────────────────────────────────────────
+    print(f"[Modulario] {target}")
+    print(f"R:{summary['red']}  O:{summary['orange']}  Y:{summary['yellow']}"
+          f"  L:{summary['lime']}  G:{summary['green']}  Total:{summary['total']}")
+    print()
+
+    # ── Hotspots ──────────────────────────────────────────────────────────────
+    hotspots = [f for f in files if f['status'] in ('RED', 'ORANGE')]
+    hotspots.sort(key=lambda f: f['loc'] + f['deps'] * 20, reverse=True)
+
+    if hotspots:
+        print("Hotspots (RED/ORANGE, ranked by combined score):")
+        for f in hotspots:
+            score = f['loc'] + f['deps'] * 20
+            flag  = '●' if f['status'] == 'RED' else '◆'
+            print(f"  {flag} {f['status']:6}  {f['path']:<65}  "
+                  f"LOC:{f['loc']:>5}  DEPS:{f['deps']:>3}  score:{score:>5}")
+    else:
+        print("Hotspots: none — all files are YELLOW or better.")
+    print()
+
+    # ── Violations ────────────────────────────────────────────────────────────
+    cycles  = violations.get('cycles', [])
+    private = violations.get('private', [])
+    if cycles or private:
+        print("Violations:")
+        for c in cycles:
+            chain = ' → '.join(os.path.basename(p) for p in c['files'])
+            print(f"  [CYCLE]   {chain}")
+        for p in private:
+            print(f"  [PRIVATE] {p['importer']} imports {p['member']}")
+    else:
+        print("Violations: none")
+    print()
+
+    # ── Coupling ──────────────────────────────────────────────────────────────
+    coup_file = str(sp)[:-5] + '_coupling.json'
+    if os.path.exists(coup_file):
+        with open(coup_file) as f:
+            coupling = json.load(f)
+        session_count = coupling.get('session_count', 0)
+        thresholds_data = {}
+        if THRESHOLDS.exists():
+            try:
+                with open(THRESHOLDS) as f:
+                    thresholds_data = json.load(f)
+            except Exception:
+                pass
+        min_sessions = thresholds_data.get('coupling_min_sessions', 20)
+        pairs = coupling.get('pairs', [])
+        strong = [p for p in pairs if p['coupling_status'] in ('STRONG', 'CRITICAL')]
+
+        print(f"Coupling: {session_count} sessions of history  "
+              f"({'active' if session_count >= min_sessions else f'inactive — need {min_sessions}'})")
+        if strong:
+            print("  STRONG / CRITICAL pairs:")
+            for p in strong[:10]:
+                print(f"    {p['coupling_status']:8}  {p['file_a']:<45} ↔  {p['file_b']:<45}"
+                      f"  {p['coupling_strength']:.0%}  ({p['co_change_count']}× / "
+                      f"{p['sessions_a']}|{p['sessions_b']} sessions)")
+        elif pairs:
+            print(f"  {len(pairs)} MODERATE pair(s) — below warning threshold")
+        else:
+            print("  No pairs above MODERATE threshold yet")
+    else:
+        print("Coupling: no history yet (run a session with mod active)")
+    print()
+
+
+def cmd_graph(argv):
+    """Print fan-out and fan-in for a file using the current state.json."""
+    import argparse as _ap
+    p = _ap.ArgumentParser(prog='mod graph', add_help=False)
+    p.add_argument('file')
+    p.add_argument('--target', default=None, help='Override active target directory')
+    args = p.parse_args(argv)
+
+    if args.target:
+        target = os.path.realpath(os.path.expanduser(args.target))
+        if not os.path.isdir(target):
+            print(f"Not a directory: {args.target}")
+            sys.exit(1)
+        file_path = os.path.realpath(os.path.expanduser(args.file))
+        if not os.path.isabs(args.file):
+            file_path = os.path.realpath(os.path.join(target, args.file))
+        if not os.path.isfile(file_path):
+            print(f"Not a file: {args.file}")
+            sys.exit(1)
+        rel_path = os.path.relpath(file_path, target)
+    else:
+        target, rel_path = resolve_target_file(args.file)
+
+    sp = state_path_for(target)
+    if not sp.exists():
+        print(f"No state found for {target}. Run `mod {target}` first.")
+        sys.exit(1)
+
+    with open(sp) as f:
+        state = json.load(f)
+
+    graph = state.get('import_graph', {})  # rel_path -> [rel_path, ...]
+
+    imports = graph.get(rel_path, [])
+
+    imported_by = []
+    for src, targets in graph.items():
+        if rel_path in targets:
+            imported_by.append(src)
+
+    print(f"[Modulario] graph: {rel_path}")
+    print()
+
+    print(f"  Imports ({len(imports)}):")
+    if imports:
+        for p in sorted(imports):
+            print(f"    -> {p}")
+    else:
+        print("    (none within target)")
+
+    print()
+    print(f"  Imported by ({len(imported_by)}):")
+    if imported_by:
+        for p in sorted(imported_by):
+            print(f"    <- {p}")
+    else:
+        print("    (nothing imports this file)")
+
+
+def cmd_watch(argv):
+    WATCH_MARKER = '# modulario:template'
+    SKIP_DIRS = {'.git', 'node_modules', '__pycache__', '.next', 'dist', 'build', 'venv', '.venv'}
+    import argparse as _ap
+    p = _ap.ArgumentParser(prog='mod watch', add_help=True)
+    sub = p.add_subparsers(dest='watch_cmd', required=True)
+
+    sub.add_parser('run', help='Run all enabled watch.py scripts')
+
+    p_init = sub.add_parser('init', help='Create a watch.py template in a folder')
+    p_init.add_argument('folder')
+
+    sub.add_parser('status', help='Show watch.py status for all folders')
+
+    p_enable = sub.add_parser('enable', help='Enable a watch for a folder')
+    p_enable.add_argument('folder')
+
+    p_disable = sub.add_parser('disable', help='Disable a watch for a folder')
+    p_disable.add_argument('folder')
+
+    p_dismiss = sub.add_parser('dismiss', help='Dismiss watch nag (folder has no source files)')
+    p_dismiss.add_argument('folder')
+
+    args = p.parse_args(argv)
+    target = active_target_dir()
+
+    if args.watch_cmd == 'run':
+        watch_runner = Path(__file__).resolve().parent.parent / 'scripts' / 'modulario-watch-runner.py'
+        result = subprocess.run(
+            [sys.executable, str(watch_runner),
+             '--target', target, '--changed-file', '', '--print-plain'],
+            capture_output=True, text=True,
+        )
+        print(result.stdout or '(no filled watches to run)')
+        return
+
+    if args.watch_cmd == 'init':
+        _, folder = resolve_target_folder(args.folder)
+        folder_name = folder.rstrip('/').split('/')[-1] if folder != '/' else os.path.basename(target)
+        abs_watch = os.path.join(target, folder.rstrip('/'), 'watch.py') if folder != '/' else os.path.join(target, 'watch.py')
+        if os.path.exists(abs_watch):
+            print(f"File already exists: {folder}watch.py")
+            sys.exit(1)
+        depth = len(folder.rstrip('/').split('/')) if folder != '/' else 0
+        parents = '/'.join(['..'] * depth) if depth else '.'
+        template = f'''{WATCH_MARKER}
+"""watch.py — health checks for {folder_name}
+
+Auto-generated by Modulario. Fill in the stub functions below with real
+checks for this folder. Remove the marker comment on line 1 when done.
+Runs via `mod watch` — exit 0 = PASS, exit non-zero = FAIL.
+"""
+import sys
+import os
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '{parents}'))
+
+
+# ── Import checks ──────────────────────────────
+# Verify key modules in this folder can be imported without error.
+def check_imports():
+    pass  # e.g. from {folder_name} import main_module
+
+
+# ── Public API checks ─────────────────────────
+# Verify expected functions/classes exist and are callable.
+def check_public_api():
+    pass  # e.g. assert callable(main_module.some_function)
+
+
+# ── Invariant checks ──────────────────────────
+# Verify structural rules that must remain true for this folder.
+def check_invariants():
+    pass  # e.g. assert config file exists, assert no forbidden patterns
+
+
+# ── Run all checks ────────────────────────────
+if __name__ == '__main__':
+    checks = [check_imports, check_public_api, check_invariants]
+    for fn in checks:
+        try:
+            fn()
+        except Exception as e:
+            print(f"FAIL {{fn.__name__}}: {{e}}", file=sys.stderr)
+            sys.exit(1)
+'''
+        os.makedirs(os.path.dirname(abs_watch), exist_ok=True)
+        with open(abs_watch, 'w') as f:
+            f.write(template)
+        print(f"Created {folder}watch.py — fill in the check stubs.")
+        return
+
+    if args.watch_cmd == 'status':
+        unfilled = []
+        filled = []
+        disabled = []
+        for root, dirs, filenames in os.walk(target):
+            dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+            watch = os.path.join(root, 'watch.py')
+            rel = os.path.relpath(root, target)
+            rel = '/' if rel == '.' else rel + '/'
+            if os.path.exists(os.path.join(root, '.watch.dismissed')):
+                continue
+            if os.path.exists(os.path.join(root, '.watch.disabled')):
+                disabled.append(rel)
+                continue
+            if not os.path.exists(watch):
+                unfilled.append((rel, 'missing'))
+            else:
+                try:
+                    with open(watch, 'r') as f:
+                        first_line = f.readline()
+                    if WATCH_MARKER in first_line:
+                        unfilled.append((rel, 'unfilled'))
+                    else:
+                        filled.append(rel)
+                except OSError:
+                    pass
+        if filled:
+            print(f"Enabled ({len(filled)}):")
+            for folder in sorted(filled):
+                print(f"  {folder}")
+        if disabled:
+            print(f"Disabled ({len(disabled)}):")
+            for folder in sorted(disabled):
+                print(f"  {folder}")
+        if unfilled:
+            print(f"Unfilled ({len(unfilled)}):")
+            for folder, st in sorted(unfilled):
+                print(f"  {folder:<40} {st}")
+        if not filled and not disabled and not unfilled:
+            print("No folders found.")
+        return
+
+    if args.watch_cmd == 'enable':
+        _, folder = resolve_target_folder(args.folder)
+        abs_folder = os.path.join(target, folder.rstrip('/')) if folder != '/' else target
+        marker = os.path.join(abs_folder, '.watch.disabled')
+        if os.path.exists(marker):
+            os.remove(marker)
+            print(f"Enabled watch for '{folder}'.")
+        else:
+            print(f"Watch for '{folder}' is already enabled.")
+        return
+
+    if args.watch_cmd == 'disable':
+        _, folder = resolve_target_folder(args.folder)
+        abs_folder = os.path.join(target, folder.rstrip('/')) if folder != '/' else target
+        marker = os.path.join(abs_folder, '.watch.disabled')
+        if os.path.exists(marker):
+            print(f"Watch for '{folder}' is already disabled.")
+        else:
+            with open(marker, 'w') as f:
+                f.write('')
+            print(f"Disabled watch for '{folder}'.")
+        return
+
+    if args.watch_cmd == 'dismiss':
+        _, folder = resolve_target_folder(args.folder)
+        abs_folder = os.path.join(target, folder.rstrip('/')) if folder != '/' else target
+        marker = os.path.join(abs_folder, '.watch.dismissed')
+        if os.path.exists(marker):
+            print(f"Already dismissed: {folder}")
+            return
+        watch_file = os.path.join(abs_folder, 'watch.py')
+        if os.path.exists(watch_file):
+            with open(watch_file, 'r') as f:
+                first_line = f.readline()
+            if WATCH_MARKER in first_line:
+                os.remove(watch_file)
+        with open(marker, 'w') as f:
+            f.write('')
+        print(f"Dismissed watch nag for '{folder}'.")
+        return
+
+
+def cmd_document(argv):
+    TEMPLATE_MARKER = '<!-- modulario:template -->'
+    import argparse as _ap
+    p = _ap.ArgumentParser(prog='mod doc', add_help=True)
+    sub = p.add_subparsers(dest='doc_cmd', required=True)
+
+    p_init = sub.add_parser('init', help='Create a doc template for a folder')
+    p_init.add_argument('folder', help='Folder to create template for')
+
+    sub.add_parser('list', help='Show folders with unfilled doc templates')
+
+    p_dismiss = sub.add_parser('dismiss', help='Dismiss doc nag for a folder')
+    p_dismiss.add_argument('folder', help='Folder to dismiss')
+
+    args = p.parse_args(argv)
+    target = active_target_dir()
+
+    if args.doc_cmd == 'init':
+        _, folder = resolve_target_folder(args.folder)
+        folder_name = folder.rstrip('/').split('/')[-1] if folder != '/' else os.path.basename(target)
+        abs_doc = os.path.join(target, folder.rstrip('/'), 'README.md') if folder != '/' else os.path.join(target, 'README.md')
+        if os.path.exists(abs_doc):
+            print(f"File already exists: {folder}README.md")
+            sys.exit(1)
+        template = f"""{TEMPLATE_MARKER}
+# {folder_name}
+
+## Purpose
+- One or two sentences on what this folder is responsible for.
+- Describe the business/domain concern, not the technical details.
+
+## Owns
+- List the main responsibilities this folder **does own**.
+- Each item should be something that changes when this folder changes.
+
+## Does NOT own
+- List responsibilities that live elsewhere to prevent scope creep.
+- Link to the other folder/module if relevant.
+
+## Key Files
+- `example.js`: short description of what this file is and when it runs.
+
+## Data & External Dependencies
+- What data models or types this area works with.
+- What external services or libraries it directly touches.
+- Any important shared modules it depends on.
+
+## How It Works (Flow)
+1. Brief step-by-step of the main flow.
+2. Optional secondary flows if they are important.
+
+## Invariants & Constraints
+- Rules that **must** remain true.
+- Performance or security constraints.
+- "Never do X" type rules that are easy to forget.
+
+## Extension Points
+- How to add a new feature in this area.
+- What file to start from when extending behavior.
+
+## Known Issues, Recurring Bugs, and Pain Points (and How to Prevent Them)
+
+- **Short name of issue** — `ACTIVE` or `RESOLVED`
+  - When it happens: one line about the situation/context.
+  - Symptom: what you see break.
+  - Root cause: the underlying mistake or assumption.
+  - Prevention/fix: the rule, pattern, or helper to use so it doesn't come back.
+  - Status: `ACTIVE` = still a risk, `RESOLVED` = was an issue, now fixed (keep for history).
+
+## Recent Changes
+- {datetime.now().strftime('%Y-%m-%d')}: Initial doc created.
+"""
+        os.makedirs(os.path.dirname(abs_doc), exist_ok=True)
+        with open(abs_doc, 'w') as f:
+            f.write(template)
+        print(f"Created {folder}README.md — fill in the template.")
+        return
+
+    if args.doc_cmd == 'list':
+        # Scan target for folders with unfilled templates
+        unfilled = []
+        filled = []
+        for root, dirs, filenames in os.walk(target):
+            dirs[:] = [d for d in dirs if d not in ('.git', 'node_modules', '__pycache__', '.next', 'dist', 'build')]
+            readme = os.path.join(root, 'README.md')
+            rel = os.path.relpath(root, target)
+            if rel == '.':
+                rel = '/'
+            else:
+                rel = rel + '/'
+            if os.path.exists(os.path.join(root, '.doc.dismissed')):
+                continue
+            if not os.path.exists(readme):
+                unfilled.append((rel, 'missing'))
+            else:
+                try:
+                    with open(readme, 'r') as f:
+                        first_line = f.readline()
+                    if TEMPLATE_MARKER in first_line:
+                        unfilled.append((rel, 'unfilled'))
+                    else:
+                        filled.append(rel)
+                except OSError:
+                    pass
+        if unfilled:
+            print(f"Unfilled ({len(unfilled)}):")
+            for folder, status in sorted(unfilled):
+                print(f"  {folder:<40} {status}")
+        if filled:
+            print(f"Filled ({len(filled)}):")
+            for folder in sorted(filled):
+                print(f"  {folder}")
+        if not unfilled and not filled:
+            print("No folders found.")
+        return
+
+    if args.doc_cmd == 'dismiss':
+        _, folder = resolve_target_folder(args.folder)
+        abs_folder = os.path.join(target, folder.rstrip('/')) if folder != '/' else target
+        marker = os.path.join(abs_folder, '.doc.dismissed')
+        if os.path.exists(marker):
+            print(f"Already dismissed: {folder}")
+            return
+        # Remove the unfilled template if it exists
+        readme = os.path.join(abs_folder, 'README.md')
+        if os.path.exists(readme):
+            with open(readme, 'r') as f:
+                first_line = f.readline()
+            if TEMPLATE_MARKER in first_line:
+                os.remove(readme)
+        with open(marker, 'w') as f:
+            f.write('')
+        print(f"Dismissed doc nag for '{folder}'. Remove {folder}.doc.dismissed to re-enable.")
+        return
+
+
+def cmd_off():
+    if CURRENT_TARGET.exists():
+        CURRENT_TARGET.unlink()
+        print("Modulario hook deactivated.")
+    else:
+        print("No active target.")
+
+
+def print_help():
+    print("""
+  mod — structural health monitor
+
+  Usage:
+    mod <directory>         Analyze and show live TUI
+    mod query <directory>   CLI report only — no TUI (for Claude agent use)
+    mod churn show          Show file-specific churn rules
+    mod churn disable <file>
+                            Disable churn warning for one file in current target
+    mod churn raise <file> --high N [--critical N]
+                            Raise churn thresholds for one file in current target
+    mod churn enable <file> Remove file-specific churn override
+    mod watch run           Run all enabled watch.py scripts
+    mod watch status        Show watch.py status for all folders
+    mod watch init <folder> Create a watch.py template in a folder
+    mod watch enable <folder>
+                            Enable a watch for a folder
+    mod watch disable <folder>
+                            Disable a watch for a folder
+    mod watch dismiss <folder>
+                            Dismiss watch nag (folder has no source files)
+    mod doc init <folder>   Create a README.md template in a folder
+    mod doc list            Show unfilled/filled doc status for all folders
+    mod doc dismiss <folder>
+                            Dismiss doc nag for a folder
+    mod graph <file> [--target <dir>]
+                            Show what a file imports and what imports it (fan-out + fan-in)
+                            --target overrides the active mod directory
+    mod off                 Deactivate hook (stop tracking)
+    mod help                This help
+
+  The Claude and Codex hooks fire on every Write/Edit and track the last directory
+  you pointed mod at.  Use `mod off` to pause it between projects.
+""")
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ('-h', '--help', '-help', 'help'):
+        print_help()
+        return
+
+    if args[0] == 'query':
+        if len(args) < 2:
+            print("Usage: mod query <directory>")
+            sys.exit(1)
+        cmd_query(args[1])
+        return
+
+    if args[0] == 'churn':
+        cmd_churn(args[1:])
+        return
+
+    if args[0] == 'off':
+        cmd_off()
+        return
+
+    if args[0] == 'watch':
+        cmd_watch(args[1:])
+        return
+
+    if args[0] == 'doc':
+        cmd_document(args[1:])
+        return
+
+    if args[0] == 'graph':
+        cmd_graph(args[1:])
+        return
+
+    cmd_launch(args[0])
+
+
+if __name__ == '__main__':
+    main()

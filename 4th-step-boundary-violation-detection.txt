@@ -1,0 +1,166 @@
+MODULARIO — Step 4: Boundary Violation Detection
+Circular import detection + private API access violations, surfaced as blocking PostToolUse output
+===========================================================================================
+
+EMPIRICAL BASIS
+---------------
+Ease: 70 / 100   Impact: 85 / 100
+
+Circular dependency research is unusually consistent: most defects and defective components
+are concentrated in cyclically-dependent components or their direct neighbors. A six-application
+empirical study found cyclic components had dramatically higher defect density than acyclic ones.
+Unlike LOC or DEPS — which are probabilistic signals — circularity is a binary architectural
+failure. Either the import graph is a DAG or it is not. This makes it a high-precision,
+low-noise signal with no threshold to tune.
+
+Private API access violations are the specific failure mode the LMPL '25 paper documented
+in its module integration experiment: the LLM generated code that appeared modular (separate
+files, dependency injection) while directly accessing _nextId and _todos (private store members)
+instead of using the available public API. Detection requires nothing more than a regex.
+
+Both signals are actionable in a way LOC/DEPS are not: they name the specific violation,
+the specific files involved, and the specific fix. Claude can self-correct immediately.
+
+
+--------------------------------------------------------------------------------------------
+WHAT IT ADDS TO THE ANALYZER
+--------------------------------------------------------------------------------------------
+
+Two new analysis passes in modulario-analyze.py, run after the file walk:
+
+
+Pass 1 — Circular Import Detection
+------------------------------------
+The analyzer already collects import relationships to count DEPS per file.
+Step 4 extends this by building a directed import graph across the whole project
+and running a topological sort (Kahn's algorithm or DFS with cycle detection).
+
+Any cycle in the graph is a violation. Output is the specific cycle path:
+  A → B → C → A
+
+Multiple cycles are each reported separately.
+
+Detection is O(V + E) where V = files and E = imports — effectively free at any
+realistic codebase size. The import graph is already mostly constructed (DEPS counting
+currently discards the graph after counting edges per node). Step 4 retains the full
+directed graph and adds the cycle-detection pass.
+
+
+Pass 2 — Private API Access Violation Detection
+-------------------------------------------------
+For each import statement collected during the file walk, check whether the imported
+name crosses a module boundary AND references a private member.
+
+The rule: if file A imports from file B using a name that starts with _ or __,
+and A and B are in different directories (different modules), flag it.
+
+Python example: from module._internals import X  →  VIOLATION
+Python example: from .utils import _helper       →  VIOLATION (underscore, even within package)
+JS example: import { _state } from '../store'    →  VIOLATION
+
+This is a single regex pass over already-collected import strings.
+Cost: negligible.
+
+
+--------------------------------------------------------------------------------------------
+HOW VIOLATIONS ARE SURFACED
+--------------------------------------------------------------------------------------------
+
+Violations are output differently from size warnings.
+
+Size warnings ([!] lines) are informational — Claude sees them and may or may not act.
+Violations are BLOCKING — the hook exits with code 2, which Claude Code surfaces as an
+error that Claude must address before proceeding.
+
+The PostToolUse hook (modulario-hook.sh) already calls the analyzer with --print-summary.
+Step 4 adds --check-violations. If any violations exist for files touched in the current
+session, the analyzer prints the violation block and exits 2.
+
+Exit code 2 behavior (from Claude Code docs): stderr text is shown to Claude as an error
+message instead of the normal tool result. This is architecturally immune to context decay —
+it does not rely on Claude having read instructions earlier in the session.
+
+Example violation output (stderr, exit 2):
+
+  [Modulario] VIOLATION — circular import detected:
+    utilities/current_goals/window.py
+    → utilities/current_goals/editor.py
+    → utilities/current_goals/window.py
+  Fix: one of these files must stop importing the other.
+  This write has been flagged. Resolve the cycle before continuing.
+
+  [Modulario] VIOLATION — private API access:
+    web-components/js/week.js imports _state from store/_internal.js
+  Fix: use the public API (store.getState()) instead of accessing _state directly.
+
+
+--------------------------------------------------------------------------------------------
+WHAT THIS DOES NOT DO
+--------------------------------------------------------------------------------------------
+
+- Does not detect logical coupling (two files with no import relationship that share
+  hidden state through a global object or event bus). That requires change coupling
+  tracking (Step 6).
+- Does not enforce architectural layer rules (UI must not import from infrastructure).
+  That requires an ARCHITECTURE.md contract and import-linter (optional future step).
+- Does not block edits that don't introduce new violations. A file that already had a
+  circular import before this session started will show in the TUI but will not trigger
+  a blocking exit unless the current write touches a file in the cycle.
+
+
+--------------------------------------------------------------------------------------------
+CHANGES TO EXISTING FILES
+--------------------------------------------------------------------------------------------
+
+modulario-analyze.py
+  - After walk_target(), build a directed import graph (source_file → imported_file)
+    from the per-file import data already collected
+  - Add detect_cycles(graph) → list of cycle paths
+  - Add detect_private_violations(import_graph) → list of (importer, importee, member)
+  - Add --check-violations flag to main()
+  - If violations exist and --check-violations is set, print to stderr and sys.exit(2)
+  - Violations are also written into state.json under a new 'violations' key so the TUI
+    can display them
+
+modulario-hook.sh
+  - Pass --check-violations to the analyzer call
+
+modulario-tui.py
+  - Add a VIOLATIONS section below the triangle matrix showing any current cycles
+    and private API violations
+  - Violations shown in RED regardless of the file's LOC/DEPS status
+
+
+--------------------------------------------------------------------------------------------
+BUILD ORDER
+--------------------------------------------------------------------------------------------
+
+Step 1: Extend the analyzer's file walk to retain the full import graph
+  Currently each file's imports are counted and discarded after DEPS is computed.
+  Instead, store imports as a dict: {file_path: [imported_file_path, ...]}
+  Only local imports (already filtered for DEPS) matter here.
+
+Step 2: Implement detect_cycles()
+  Use DFS with a recursion stack (standard algorithm, ~20 lines).
+  Return a list of cycle paths, each as an ordered list of file paths.
+  Test against a small synthetic case (three files that form a triangle) before
+  running on real projects.
+
+Step 3: Implement detect_private_violations()
+  Iterate the import statements collected during the walk.
+  For each import, check: does the imported name contain a leading underscore?
+  Does the import cross a directory boundary (importer_dir != importee_dir)?
+  If both: append to violations list.
+
+Step 4: Wire --check-violations into the hook
+  Test manually: create a temporary circular import in a test directory,
+  run the hook, confirm exit code 2 and the violation message.
+
+Step 5: Add violations display to the TUI
+  Violations go below the triangle matrix.
+  If no violations: show "No boundary violations detected."
+  If violations: list each one with file paths and type.
+
+Step 6: Run against Delta-Note-Local and Delta-Drills-Local
+  Audit the results. Some cycles may be legitimate (e.g. __init__.py re-exports).
+  Add an ignore list to thresholds.json for known false positives.

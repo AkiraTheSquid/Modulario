@@ -1,0 +1,310 @@
+MODULARIO — Step 5: Churn Tracking Across Sessions
+Per-file modification frequency tracked across analyzer runs, surfaced in TUI and hook output
+===========================================================================================
+
+EMPIRICAL BASIS
+---------------
+Ease: 60 / 100   Impact: 90 / 100
+
+Microsoft's study of Windows Server 2003 (44 million lines) defined relative code churn as a
+suite of 8 metrics (M1–M8). The critical finding: used together, they discriminate fault-prone
+from non-fault-prone components with 89% accuracy. No individual metric achieves this alone —
+each cross-checks the others. Specifically M5 (temporal extent) and M8 (edit size) together
+catch the most dangerous pattern: few very large edits in a short time.
+
+For AI-assisted development, churn is especially meaningful. GitClear 2025 (211M lines):
+AI-assisted code churn rate jumped from 5.5% → 7.9%; refactoring fraction dropped from 25%
+to under 10%. High churn with stable/growing LOC — the pattern Modulario detects — is the
+fingerprint of AI copy-paste accumulation rather than genuine structural improvement.
+
+
+--------------------------------------------------------------------------------------------
+IMPLEMENTATION STATUS
+--------------------------------------------------------------------------------------------
+
+PHASE 1 — COMPLETE (already implemented)
+  ✓ history.jsonl append on each analyzer run (one line per run, per-file LOC deltas)
+  ✓ churn.json aggregation (sessions_touched, total_loc_delta, relative_churn per file)
+  ✓ [~] PostToolUse warnings for HIGH/CRITICAL churn files
+  ✓ CHURN column in TUI (LOW/MED/HIGH/CRIT or —)
+  ✓ thresholds.json: churn_window (20), churn_thresholds (high=5, critical=8)
+
+  Data format written by Phase 1:
+
+  state/<hash>_history.jsonl  — one JSON line per run:
+    {"ts": "2026-03-25T21:58:00", "changed": ["a.py", "b.py"], "deltas": {"a.py": +45, "b.py": -12}}
+
+  state/<hash>_churn.json  — per-file aggregates over rolling window:
+    {
+      "window_size": 20,
+      "last_updated": "...",
+      "files": {
+        "utilities/current_goals/window.py": {
+          "sessions_touched": 7,
+          "total_loc_delta": 142,
+          "relative_churn": 0.33,
+          "last_touched": "2026-03-25T21:58:00",
+          "churn_status": "HIGH"
+        }
+      }
+    }
+
+PHASE 2 — PLANNED (this document)
+  Add full M1–M8 metrics with three time horizons.
+  Add 'U' key in TUI to open a dedicated churn analytics view.
+
+
+--------------------------------------------------------------------------------------------
+THE 8 NAGAPPAN & BALL METRICS — MAPPED TO MODULARIO'S DATA MODEL
+--------------------------------------------------------------------------------------------
+
+In the original study, the "binary" is a Windows module. In Modulario, "binary" = one file.
+"Churn event" = one history.jsonl line in which this file appears in "changed".
+"Lines worked on" = abs(delta) per event. This is a lower-bound proxy — it's the net change
+rather than added+deleted. For AI-session code, where additions dominate, this is accurate.
+
+For a given file, over a time window W (set of history entries):
+
+  n_events     = count of entries in W where this file is in "changed"
+  total_worked = sum of abs(delta) for this file across all entries in W
+  active_weeks = count of distinct ISO calendar weeks in W where this file was changed
+  current_loc  = current LOC from the most recent state.json
+  total_files  = total files in the project (from state.json)
+
+M1 — Relative churn by size
+  = total_worked / current_loc
+  High M1: this file has been heavily rewritten relative to its size.
+  Already stored as relative_churn in Phase 1 (using net delta; Phase 2 keeps this).
+
+M2 — Files touched fraction
+  Project-level only: files_changed_in_W / total_files
+  Per-file this is always 0 or 1 for a given event; the useful value is the project aggregate.
+  Shown in the header of the U view, not per-file rows.
+
+M3 — Churn event count
+  = n_events (sessions_touched in Phase 1)
+  How many times was this file touched? Already tracked.
+
+M4 — Lines worked on per file (project-level average)
+  Project-level: total_worked_all_files / total_files
+  Shown in U view header as project context.
+  Per-file: total_worked (same as numerator of M1, useful on its own for absolute volume).
+
+M5 — Active weeks
+  = active_weeks (distinct ISO weeks in W where this file changed)
+  Temporal extent. High M5 = long-running instability. Low M5 with high M1/M3 = concentrated
+  danger (few weeks, lots of churn — the riskiest pattern per the paper).
+
+M6 — Edit intensity per active week
+  = total_worked / active_weeks   (or 0 if active_weeks = 0)
+  High M6 with low M5 = the "concentrated churn" danger signal M&B specifically flag.
+
+M7 — Churn event rate per KLOC
+  = n_events / (current_loc / 1000)
+  Size-normalized frequency. High M7 on a small file = being poked constantly relative to size.
+
+M8 — Average edit size
+  = total_worked / n_events   (or 0 if n_events = 0)
+  Large M8 = few big edits. Small M8 = many tiny edits. The paper says M8 is the strongest
+  cross-check: large M8 + small M5 (few weeks) = "few massive edits in a short time" = the
+  most defect-prone combination in the entire study.
+
+
+--------------------------------------------------------------------------------------------
+THREE TIME HORIZONS
+--------------------------------------------------------------------------------------------
+
+The literature maps directly onto three observable windows in Modulario's session model:
+
+  HORIZON 1: Per-request
+    Window: the single most recent history.jsonl entry.
+    Metrics shown: M1 (how much of the file did this one edit touch?), M8 (size of this edit).
+    Research analog: JIT (Just-in-Time) defect prediction — commit-level churn.
+    Danger threshold: M1 > 0.30 on a single request = this edit changed >30% of the file.
+
+  HORIZON 2: Per-session
+    Window: all history entries within 4 hours of the most recent entry.
+    (Session boundary detection: consecutive entries with gap > 4h start a new session.)
+    Metrics shown: M1, M3, M5, M6, M8. M2 in header.
+    Research analog: sprint/iteration churn; the "3-week rework" industry window compressed
+    to AI-session scale.
+    Danger threshold: M1 > 0.40 within one session = >40% of file rewritten this session.
+
+  HORIZON 3: Cross-session (rolling window)
+    Window: last churn_window entries (default 20) from history.jsonl.
+    Metrics shown: all M1–M8.
+    Research analog: release-level churn (Nagappan's original setup). This is the 89%-accuracy
+    defect predictor.
+
+The 'h' key in the U view cycles through HORIZON 1 → 2 → 3 → 1.
+Each horizon computes its own set of metrics from the same history.jsonl source.
+
+
+--------------------------------------------------------------------------------------------
+THE 'U' KEY TUI VIEW
+--------------------------------------------------------------------------------------------
+
+Pressing 'U' in the main TUI replaces the file tree with a full-screen churn analytics view.
+Pressing 'U' again (or 'q') returns to the normal file tree.
+
+Layout (adapts to terminal width):
+
+  ┌ header row ──────────────────────────────────────────────────────────────────────────┐
+  │ [Churn Analytics]  target: <dir>  horizon: CROSS-SESSION (last 20 runs)  h=cycle     │
+  │ Project M2: 38/190 files touched  M4 avg: 23 lines/file/event                        │
+  └──────────────────────────────────────────────────────────────────────────────────────┘
+
+  Column header:
+    file                           M1     M3    M5    M6     M7    M8   status
+
+  File rows (sorted by M1 descending by default):
+    utilities/current_goals/window  0.33    7     2    71.0   16.2  20.3  HIGH
+    app_modules/web_main_window.py  0.18    4     1    142    6.1   35.5  MED
+    ...
+
+  Footer: s=sort  h=horizon  U/q=back  (sort cycles: M1 | M3 | M5 | M6 | M7 | M8 | PATH)
+
+Column widths (fits 80-col terminal):
+  file: w - 54 chars, M1: 6, M3: 5, M5: 5, M6: 7, M7: 6, M8: 6, status: 5
+  (M2 and M4 are project-level aggregates shown in the header, not per-file columns)
+
+Display rules:
+  - M1, M6 show 2 decimal places (ratios)
+  - M3, M5 show integers
+  - M7, M8 show 1 decimal place
+  - "—" for any metric where n_events = 0 or active_weeks = 0
+  - Files with no history yet (never appeared in changed[]) are shown at the bottom
+
+Status assignment in U view (separate from the main diagonal status):
+  CRIT: M1 > 0.5 OR (M8 > 100 AND M5 <= 1)  — big edits concentrated in ≤1 week
+  HIGH: M1 > 0.25 OR M3 >= threshold_high
+  MED:  M1 > 0.10 OR M3 >= threshold_med
+  LOW:  everything else with any history
+  —:    no history
+
+
+--------------------------------------------------------------------------------------------
+DATA MODEL ADDITIONS FOR PHASE 2
+--------------------------------------------------------------------------------------------
+
+The existing history.jsonl format is sufficient. No schema changes needed.
+
+The only new computation is session grouping (for Horizon 2). This is done at read-time:
+  - Load all history entries
+  - Group consecutive entries with gap <= 4h into the same session
+  - The "current session" = the group containing the most recent entry
+  - Session gap threshold is configurable: thresholds.json "session_gap_hours": 4
+
+thresholds.json additions:
+  "session_gap_hours": 4        — gap in hours that marks a new session boundary
+
+New computed fields for the U view (computed on-the-fly from history.jsonl, not stored):
+  m1, m3, m5, m6, m7, m8, active_weeks, total_worked — all computed per horizon at load time
+
+No new files written to disk. All M1-M8 values are derived from the existing
+history.jsonl and state.json on each TUI load. (~50 additional lines of computation.)
+
+
+--------------------------------------------------------------------------------------------
+CHANGES TO EXISTING FILES (PHASE 2)
+--------------------------------------------------------------------------------------------
+
+modulario-tui.py
+  - Add compute_churn_metrics(entries, file_path, current_loc) function
+      Takes a list of history entries (the window), returns M1–M8 dict for one file.
+  - Add group_sessions(entries, gap_hours=4) function
+      Groups entries into sessions by time gap. Returns list of session entry-lists.
+  - Add load_history(state_path_str) function
+      Reads _history.jsonl, parses all entries, returns list.
+  - Add compute_all_metrics(history, files, horizon, thresholds) function
+      For each file, computes M1–M8 over the requested horizon window.
+      Returns {path: {m1, m3, m5, m6, m7, m8, active_weeks, total_worked, churn_status_u}}.
+  - Add draw_churn_view(stdscr, ...) function
+      Full-screen churn analytics view. Separate draw function, not a branch inside draw().
+  - In run_tui(): add 'U' key toggle and 'h' key horizon cycle
+  - In data dict: add 'show_churn_view': False, 'churn_horizon': 2 (default: cross-session),
+      'churn_metrics': {}, 'history': []
+
+thresholds.json
+  - Add "session_gap_hours": 4
+
+
+--------------------------------------------------------------------------------------------
+BUILD ORDER (PHASE 2)
+--------------------------------------------------------------------------------------------
+
+Step 1: Add history loading and session grouping to TUI
+  load_history() reads _history.jsonl.
+  group_sessions() groups entries by time gap.
+  No UI changes yet. Test: load a real history.jsonl and verify session grouping is correct.
+
+Step 2: Implement compute_churn_metrics() for all 8 metrics
+  For a given file and a list of entries (the window), compute M1–M8.
+  Test with manually constructed history data: verify M5 counts distinct ISO weeks correctly,
+  M6 = M4 per active week, M8 = total_worked / n_events.
+
+Step 3: Add compute_all_metrics() with 3-horizon dispatch
+  Per-request window = [last_entry] if last_entry contains this file, else []
+  Per-session window = entries in the current session group
+  Cross-session window = last churn_window entries
+  Test: run 3+ sessions with known edits, verify each horizon shows expected values.
+
+Step 4: Build draw_churn_view()
+  File rows sorted by M1 descending. Status color from churn_status_u rules above.
+  Project-level M2 and M4 in header.
+  's' key cycles sort column. 'h' key cycles horizon.
+  Test: verify layout renders cleanly at 80, 100, 120 cols. Verify — appears for untouched files.
+
+Step 5: Wire 'U' key in run_tui()
+  'U' toggles show_churn_view. When True, draw_churn_view() is called instead of draw().
+  'h' in churn view cycles churn_horizon (0=per-request, 1=per-session, 2=cross-session).
+  Test: toggle in/out, verify state is preserved on return to main view.
+
+Step 6: Calibrate U-view status thresholds against real data
+  After 2–3 weeks of real sessions, check which files the U view flags as CRIT/HIGH.
+  Compare against files you'd independently identify as problematic.
+  Adjust the M1/M8/M5 threshold values in thresholds.json.
+
+
+--------------------------------------------------------------------------------------------
+WHAT THE U VIEW SHOWS THAT THE MAIN TUI DOES NOT
+--------------------------------------------------------------------------------------------
+
+Main TUI CHURN column (Phase 1):
+  Single number — sessions_touched as a fraction of window (LOW/MED/HIGH/CRIT).
+  Designed for quick glance: "is this file accumulating change?"
+
+U view (Phase 2):
+  The full diagnostic: WHY is this file concerning?
+  M1 tells you the magnitude relative to file size.
+  M3 tells you how many times you've touched it.
+  M5 tells you whether it's been a long-running instability or a recent concentrated burst.
+  M6 tells you the intensity when it does change.
+  M8 tells you whether changes are careful (small M8) or large rewrites (large M8).
+  M7 cross-checks M1 from a frequency rather than volume angle.
+  Together they give you the same diagnostic picture the Microsoft study found most predictive.
+
+The U view is for weekly review or when deciding which file to refactor next.
+The main TUI CHURN column is for moment-to-moment session awareness.
+
+
+--------------------------------------------------------------------------------------------
+WHAT THIS DOES NOT DO
+--------------------------------------------------------------------------------------------
+
+- Does not track which lines changed, only that a file changed and by how much LOC.
+  This means "lines worked on" is a proxy (net delta) rather than added+deleted.
+  In practice for AI sessions this is close enough — additions dominate.
+
+- Does not track churn at function/method level. File-level is sufficient for structural
+  health. Function-level would require parsing and line-level diffing.
+
+- Does not use git. Intentional — git history predates Modulario activation and would
+  pollute the signal. This is AI-session-specific churn only.
+
+- M2 (files touched fraction) and M4 (lines per file, project average) are shown in the U
+  view header as project context only, not as per-file columns. They're not meaningful
+  per-file — they're component/project-level diagnostics.
+
+- The U view does not replace the diagonal score. LOC × DEPS captures structural snapshot.
+  Churn captures temporal evolution. They answer different questions.

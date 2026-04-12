@@ -1,0 +1,282 @@
+MODULARIO — Simple MVP Plan
+Based on: The Modular Imperative (LMPL 2025) + AI-Assisted Modular Workflow doc
+===========================================================================================
+
+WHAT IT IS
+----------
+A Claude Code companion that gives you real-time structural health monitoring of a target
+codebase while you work. It runs alongside your Claude Code session in a second terminal
+window as a live TUI (terminal UI). Every time Claude edits a file, the TUI updates
+automatically to show the current LOC and dependency count for every file in the tree.
+
+The goal for MVP is Layer 1 only: the 2D structural metric.
+Layers 2 (language-specific scaffolding) and 3 (defensive prompting) come after.
+
+
+--------------------------------------------------------------------------------------------
+LAYER 1 — THE 2D STRUCTURAL METRIC (MVP)
+--------------------------------------------------------------------------------------------
+
+THE TWO DIMENSIONS
+------------------
+Every file in the target codebase is characterized by two numbers:
+
+  LOC  — lines of code (non-blank, non-comment)
+  DEPS — number of unique external imports/dependencies (files or packages this file pulls in)
+
+These two dimensions are counterbalanced against each other on purpose:
+
+  Low LOC  + Low DEPS  →  green   (healthy, self-contained)
+  High LOC + Low DEPS  →  yellow  (large but self-contained — watch but not alarming)
+  Low LOC  + High DEPS →  yellow  (small glue file with many connections — potential hub)
+  High LOC + High DEPS →  red     (fat hub — the real problem, hides coupling)
+
+Enforcing LOC alone pushes the AI to split files aggressively, which increases DEPS.
+Enforcing DEPS alone pushes the AI to consolidate, which inflates LOC.
+The 2D view catches both failure modes simultaneously.
+
+THRESHOLDS (starting values, tunable)
+--------------------------------------
+  LOC warning:   > 200 lines
+  LOC critical:  > 400 lines
+  DEPS warning:  > 5 external imports
+  DEPS critical: > 10 external imports
+
+  Color is assigned based on worst dimension:
+    both within warning → green
+    either at warning   → yellow
+    either at critical  → red
+    both at critical    → red + bold
+
+These thresholds are advisory in MVP. No hard failures yet.
+
+
+--------------------------------------------------------------------------------------------
+HOW IT INTEGRATES WITH CLAUDE CODE
+--------------------------------------------------------------------------------------------
+
+ARCHITECTURE
+------------
+There are three components:
+
+  1. ANALYZER (modulario-analyze.sh or modulario_analyze.py)
+     Runs against the target codebase directory.
+     Computes LOC and DEPS for every file.
+     Writes results to a JSON data file: /home/stellar-thread/Applications/Modulario/data/state.json
+
+  2. CLAUDE HOOK (PostToolUse)
+     Configured in Claude Code's settings.json.
+     After every file write or edit by Claude, the hook calls the analyzer.
+     This keeps state.json current after every Claude action.
+
+  3. TUI (modulario-tui.py)
+     Runs in a second terminal window, watching state.json.
+     Re-renders the tree whenever state.json changes (via inotify or polling).
+     Displays the directory tree with LOC and DEPS columns, color-coded.
+
+FLOW
+----
+  You type a prompt to Claude Code
+  →  Claude reads and edits files
+  →  PostToolUse hook fires after each edit
+  →  Hook runs modulario-analyze on the target directory
+  →  state.json is updated
+  →  TUI detects the change and re-renders
+  →  You see the updated structural health in real time
+
+No manual steps. No polling loop you have to trigger. It just updates.
+
+HOW THE HOOK IS CONFIGURED
+---------------------------
+Claude Code hooks live in settings.json. The global one is at:
+  ~/.claude/settings.json
+
+A per-project one can live at:
+  <project-dir>/.claude/settings.json  (takes precedence for that project)
+
+The PostToolUse hook entry looks like:
+
+  {
+    "hooks": {
+      "PostToolUse": [
+        {
+          "matcher": "Write|Edit|NotebookEdit",
+          "hooks": [
+            {
+              "type": "command",
+              "command": "/home/stellar-thread/Applications/Modulario/scripts/modulario-analyze.sh"
+            }
+          ]
+        }
+      ]
+    }
+  }
+
+The hook script receives context about what file was just changed (via environment variables
+or stdin depending on hook type). It reruns the full directory analysis and writes state.json.
+For MVP, reanalyzing the full directory each time is fine — it is fast for small/medium repos.
+
+HOW THE TUI WORKS
+-----------------
+The TUI is a Python script using the `rich` library (already likely installed, or pip install rich).
+It runs with:
+
+  python3 /home/stellar-thread/Applications/Modulario/tui/modulario-tui.py \
+    --target /home/stellar-thread/Applications/Delta-Note-Local
+
+It reads state.json and renders a tree like:
+
+  Delta-Note-Local/
+  ├── src/
+  │   ├── components/
+  │   │   ├── Editor.js          LOC: 312  DEPS:  8   [RED]
+  │   │   ├── Toolbar.js         LOC:  87  DEPS:  3   [GREEN]
+  │   │   └── Sidebar.js         LOC: 143  DEPS:  6   [YELLOW]
+  │   ├── store/
+  │   │   ├── noteStore.js       LOC: 201  DEPS: 11   [RED]
+  │   │   └── uiStore.js         LOC:  55  DEPS:  2   [GREEN]
+  │   └── utils/
+  │       └── format.js          LOC:  34  DEPS:  1   [GREEN]
+
+At the bottom, a summary line:
+  Files: 23  |  Red: 2  |  Yellow: 4  |  Green: 17  |  Last updated: 14:32:07
+
+The TUI watches state.json via inotify (Linux, using the `watchdog` Python library or
+inotifywait) and re-renders on every change. No manual refresh needed.
+
+
+--------------------------------------------------------------------------------------------
+DIRECTORY STRUCTURE
+--------------------------------------------------------------------------------------------
+
+/home/stellar-thread/Applications/Modulario/
+  simple-modulario-plan.txt        ← this file
+  README.txt                       ← quick-start for future reference
+
+  scripts/
+    modulario-analyze.sh           ← called by Claude hook after every edit
+    modulario-analyze.py           ← Python version (used if .sh calls it)
+
+  tui/
+    modulario-tui.py               ← the live TUI, run in a second terminal
+
+  data/
+    state.json                     ← live structural snapshot (written by analyzer, read by TUI)
+
+  configs/
+    thresholds.json                ← tunable LOC and DEPS thresholds per project
+    (future: per-project ARCHITECTURE.md templates go here)
+
+  setup/
+    install.sh                     ← installs Python deps (rich, watchdog), sets up hook entry
+
+
+--------------------------------------------------------------------------------------------
+WHAT ABOUT THE CLAUDE DIRECTORY?
+--------------------------------------------------------------------------------------------
+
+The .claude directory does NOT need to move. It stays at ~/.claude (global) or inside each
+project repo (.claude/ at project root). Modulario does not own Claude's config.
+
+What Modulario owns:
+  - The analyzer script (called by the hook)
+  - The TUI
+  - The data file
+  - The threshold config
+  - The setup/install script that writes the hook entry into the right settings.json
+
+The setup script will:
+  1. Ask which project you want to monitor (e.g., Delta-Note-Local)
+  2. Detect the language (JS/TS, Python, etc.) for dependency parsing
+  3. Write the PostToolUse hook entry into that project's .claude/settings.json
+     (or into ~/.claude/settings.json if you want it globally)
+  4. Run the first analysis pass so state.json is populated before you start
+
+This means Modulario is portable: you point it at any project and it works.
+It does not require modifying Claude Code itself.
+
+
+--------------------------------------------------------------------------------------------
+DEPENDENCY PARSING (per language)
+--------------------------------------------------------------------------------------------
+
+JS/TS:
+  Scan for: import ... from '...', require('...')
+  Count unique source strings that are not from node_modules (i.e., start with ./ or ../)
+  For node_modules imports, count them separately as "external package deps" (optional display)
+
+Python:
+  Scan for: import X, from X import Y
+  Count unique module names. Distinguish stdlib, third-party, and local (relative imports).
+  For MVP, local relative imports (from . import X) are the dep count that matters.
+
+Shell/other:
+  Out of scope for MVP. Show LOC only, DEPS = N/A.
+
+The analyzer does not need to be perfect. It needs to be fast and consistent.
+The signal is relative change over time, not absolute correctness.
+
+
+--------------------------------------------------------------------------------------------
+TOKEN TRACKING (easy add-on to Layer 1)
+--------------------------------------------------------------------------------------------
+
+Claude Code already reports token usage per response. For now, log it manually:
+After each task, note the tokens in a simple log file:
+
+  /home/stellar-thread/Applications/Modulario/data/task-log.tsv
+
+Columns: date, task_description, tokens_in, tokens_out, files_changed, red_files_before, red_files_after
+
+This gives you the improvement-over-time signal you want:
+  - Did this task increase or decrease the number of red files?
+  - What did it cost in tokens?
+
+Later this can be partially automated via the Stop hook (which fires when Claude finishes).
+For MVP, manual entry after each session is fine.
+
+
+--------------------------------------------------------------------------------------------
+BUILD ORDER (what to do first)
+--------------------------------------------------------------------------------------------
+
+Step 1: Write modulario-analyze.py
+  Input: a directory path
+  Output: state.json with per-file LOC and DEPS
+  Test it standalone against Delta-Note-Local before touching Claude at all.
+
+Step 2: Write modulario-tui.py
+  Input: state.json path
+  Output: the colored tree in the terminal, auto-refreshing
+  Test it standalone by manually editing state.json and watching it re-render.
+
+Step 3: Write setup/install.sh
+  Writes the PostToolUse hook entry into the target project's settings.json
+  Runs the first analysis pass
+
+Step 4: Do one real Claude Code session with it running
+  Observe whether the TUI updates correctly after each edit.
+  Adjust thresholds based on what you see for your actual codebase.
+
+Step 5: Start the task log
+  After each session, add a row to task-log.tsv manually.
+  Track red file count before/after as the primary health signal.
+
+Layers 2 and 3 (ARCHITECTURE.md, language-specific scaffolding, defensive prompt templates)
+come after Step 4, once the real-time structural view is working and you trust it.
+
+
+--------------------------------------------------------------------------------------------
+WHAT THIS DOES NOT DO (by design, for MVP)
+--------------------------------------------------------------------------------------------
+
+- No Markov chains or probabilistic graph traversal
+- No operational co-access matrix (that needs 20-30 tasks of data)
+- No task difficulty benchmarking
+- No hard enforcement / build failures (advisory only)
+- No ARCHITECTURE.md generation (Layer 2, comes later)
+- No defensive prompt injection (Layer 3, comes later)
+- No full automation of token tracking
+
+The fastest path to a useful signal is the live TUI showing LOC + DEPS.
+Everything else builds on that once you have real data from your actual workflow.
