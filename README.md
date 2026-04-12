@@ -21,6 +21,7 @@ Modulario is the missing feedback loop. Every time a file is written, it scores 
 - **Real-time structural feedback** after every file edit, surfaced directly to Claude Code / Codex via PostToolUse hooks
 - **A live TUI** showing every file's status, the worst hotspots, recent churn, and folder-level health
 - **Auto-generated `README.md` and `watch.py`** templates in every folder, with persistent nags until they're filled in — so documentation and folder-level health checks actually get written
+- **In-the-loop watch.py feedback for Claude Code** — once you fill in a folder's `watch.py`, it runs *between Claude Code's tool calls* via the PostToolUse hook, so a broken import or violated invariant is surfaced to Claude *before its next edit*, not after the session ends. This is the killer feature, and it's why **Claude Code is the recommended frontend** — Codex's hook model doesn't feed results back into the assistant's context the same way, so the live feedback loop is much weaker there
 - **Boundary violation detection** — circular imports and private-API leaks across module boundaries
 - **Churn tracking** — flags files that keep getting touched session after session (the real bug magnets)
 - **Import graph queries** (`mod graph <file>`) — fan-in and fan-out before you rename or split anything
