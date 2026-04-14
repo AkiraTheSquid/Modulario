@@ -34,6 +34,51 @@ SKIP_DIRS = {
 SUPPORTED_EXTENSIONS = {'.py', '.js', '.ts', '.jsx', '.tsx', '.mjs', '.cjs', '.css'}
 
 
+def _touched_folders_path(output_path):
+    base, _ = os.path.splitext(output_path)
+    return base + '_touched.json'
+
+
+def update_touched_folders(output_path, target, changed_file):
+    """Persistent per-target set of folders that have been edited at least once.
+
+    Read existing set, merge in every ancestor folder of `changed_file` (relative
+    to target, excluding target root itself), persist, return the merged set.
+    Used to gate DOC/WATCH nag emission so untouched folders stay silent.
+    """
+    path = _touched_folders_path(output_path)
+    touched = set()
+    if os.path.exists(path):
+        try:
+            with open(path, 'r', encoding='utf-8') as fh:
+                touched = set(json.load(fh).get('folders', []))
+        except Exception:
+            touched = set()
+
+    if changed_file:
+        try:
+            rel = os.path.relpath(changed_file, target)
+        except ValueError:
+            rel = changed_file
+        rel = rel.replace('\\', '/')
+        if not rel.startswith('..'):
+            parts = rel.split('/')[:-1]
+            acc = []
+            for part in parts:
+                if part in ('', '.', '..'):
+                    continue
+                acc.append(part)
+                touched.add('/'.join(acc))
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, 'w', encoding='utf-8') as fh:
+                    json.dump({'folders': sorted(touched)}, fh)
+            except OSError:
+                pass
+
+    return touched
+
+
 # ─── Threshold loading ────────────────────────────────────────────────────────
 
 def load_thresholds(path):
@@ -312,8 +357,10 @@ def build_claude_summary(state, changed_file, thresholds, churn_data=None, histo
             lines.append(f"[!] {name}: DEPS {s['deps']} is medium ({deps_bands[0]+1}–{deps_bands[-1]}).")
 
     for c in violations.get('cycles', [])[:2]:
-        chain = ' → '.join(os.path.basename(p) for p in c['files'])
-        lines.append(f"[VIOLATION] Circular import: {chain}")
+        files = c['files']
+        lines.append(f"[VIOLATION] Circular import: {files[0]}")
+        for f in files[1:]:
+            lines.append(f"                          → {f}")
     for p in violations.get('private', [])[:2]:
         lines.append(f"[VIOLATION] Private access: {p['importer']} imports {p['member']}")
 
@@ -492,6 +539,8 @@ def main():
         print(format_violation_block(violations, changed_file, args.target), file=sys.stderr)
         sys.exit(2)
 
+    touched_folders = update_touched_folders(args.output, args.target, changed_file)
+
     # ── Auto-doc: ensure every folder has a README.md, nag if unfilled ──────
     TEMPLATE_MARKER = '<!-- modulario:template -->'
     doc_reminders = []
@@ -578,6 +627,9 @@ def main():
                     unfilled.append(folder)
             except OSError:
                 pass
+
+    # Gate nags to touched folders only (persistent, per target)
+    unfilled = [f for f in unfilled if f in touched_folders]
 
     # Nag about unfilled docs — pick the one closest to the changed file
     if unfilled and changed_file:
@@ -674,6 +726,8 @@ if __name__ == '__main__':
                     unfilled_watches.append(folder)
             except OSError:
                 pass
+
+    unfilled_watches = [f for f in unfilled_watches if f in touched_folders]
 
     if unfilled_watches and changed_file:
         changed_rel = changed_file

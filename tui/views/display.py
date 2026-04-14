@@ -88,6 +88,26 @@ def _churn_display(session_m1):
     return f"{'—':>5}", curses.A_DIM
 
 
+def _age_label(seconds):
+    if seconds is None or seconds < 0:
+        return f"{'—':>5}", curses.A_DIM
+    minutes = int(seconds // 60)
+    if minutes < 60:
+        m = max(1, minutes)
+        return f"{m}m".rjust(5), curses.color_pair(C_GREEN)
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours}h".rjust(5), curses.color_pair(C_LIME)
+    days = hours // 24
+    if days < 7:
+        return f"{days}d".rjust(5), curses.color_pair(C_YELLOW)
+    weeks = days // 7
+    if weeks < 4:
+        return f"{weeks}w".rjust(5), curses.color_pair(C_ORANGE)
+    months = max(1, days // 30)
+    return f"{months}M".rjust(5), curses.color_pair(C_RED) | curses.A_BOLD
+
+
 def _fan_attr(n):
     if n >= 6:
         return curses.color_pair(C_RED) | curses.A_BOLD
@@ -122,15 +142,17 @@ def draw_main_view(stdscr, rows, scroll_offset, summary, last_updated, target_di
         safe_addstr(stdscr, 0, x, seg, curses.color_pair(FILE_CPAIR[s]) | curses.A_BOLD)
         x += len(seg)
 
-    name_w = max(18, w - 35)
+    name_w = max(18, w - 47)
     safe_addstr(stdscr, 1, 0,
-                f" {'file':<{name_w - 1}}{'CHG':>10}{'LOC':>6}{'DEPS':>5}{'USED':>5}  "[:w],
+                f" {'file':<{name_w - 1}}{'CHG':>10}{'LOC':>6}{'DEPS':>5}{'USED':>5}{'DOC':>6}{'WATCH':>6}  "[:w],
                 curses.A_DIM)
     chg_x    = name_w
     loc_x    = name_w + 10
     deps_x   = name_w + 16
     fan_x    = name_w + 21
-    status_x = name_w + 26
+    doc_x    = name_w + 26
+    watch_x  = name_w + 32
+    status_x = name_w + 38
 
     _loc_bands  = thresholds.get('loc_bands',  [150, 300, 450, 600, 750])
     _deps_bands = thresholds.get('deps_bands', [4, 8, 12, 16, 20])
@@ -162,7 +184,12 @@ def draw_main_view(stdscr, rows, scroll_offset, summary, last_updated, target_di
             else:
                 out_attr = curses.color_pair(C_CYAN)
             safe_addstr(stdscr, y, deps_x, f"{out_refs:>5}", out_attr)
-            safe_addstr(stdscr, y, fan_x, f"{'0':>5}", curses.A_DIM)
+            in_refs = metric.get('in_refs', 0)
+            safe_addstr(stdscr, y, fan_x, f"{in_refs:>5}", _fan_attr(in_refs))
+            doc_lbl, doc_attr = _age_label(metric.get('doc_age_s'))
+            watch_lbl, watch_attr = _age_label(metric.get('watch_age_s'))
+            safe_addstr(stdscr, y, doc_x, f" {doc_lbl}", doc_attr)
+            safe_addstr(stdscr, y, watch_x, f" {watch_lbl}", watch_attr)
             safe_addstr(stdscr, y, status_x, "  ◈ F", curses.color_pair(C_CYAN) | curses.A_DIM)
         else:
             _, depth, name, f = row
@@ -179,6 +206,8 @@ def draw_main_view(stdscr, rows, scroll_offset, summary, last_updated, target_di
             safe_addstr(stdscr, y, deps_x,      f"{f['deps']:>5}", _band_attr(f['deps'], _deps_bands))
             fan = fan_in_map.get(f['path'], 0)
             safe_addstr(stdscr, y, fan_x,       f"{fan:>5}", _fan_attr(fan))
+            safe_addstr(stdscr, y, doc_x,       f"{'—':>6}", curses.A_DIM)
+            safe_addstr(stdscr, y, watch_x,     f"{'—':>6}", curses.A_DIM)
             safe_addstr(stdscr, y, status_x,    f"  {FILE_DOT[status]} {STATUS_LETTER[status]}", color | extra)
 
     if show_matrix:
@@ -209,7 +238,7 @@ def draw_main_view(stdscr, rows, scroll_offset, summary, last_updated, target_di
         viol_y    = CHROME_ROWS + content_h + matrix_rows
         all_items = []
         for c in violations.get('cycles', []):
-            chain = ' → '.join(p.split('/')[-1] for p in c['files'])
+            chain = ' → '.join(c['files'])
             all_items.append(('cycle', f"[CYCLE] {chain}"))
         for p in violations.get('private', []):
             all_items.append(('cycle', f"[PRIV]  {p['importer'].split('/')[-1]} imports {p['member']} from {p['module']}"))
@@ -234,7 +263,7 @@ def draw_main_view(stdscr, rows, scroll_offset, summary, last_updated, target_di
 
     end_row  = min(scroll_offset + content_h, len(rows))
     pos_info = f" {scroll_offset + 1}–{end_row}/{len(rows)} "
-    hints    = " ↑↓/jk  PgUp/PgDn  g/G  r/R refresh  m matrix  w watch  l loc  d dep  U churn  L/D/S ranked  t expand  a collapse  c copy  q quit"
+    hints    = " ↑↓/jk  PgUp/PgDn  g/G  r/R refresh  m matrix  w watch  l loc  d dep  U churn  L/D/S ranked  t expand  a collapse  c copy  b bugs  q quit"
     if flash_msg:
         safe_addstr(stdscr, h - 1, 0, flash_msg.center(w)[:w], curses.A_BOLD)
     else:

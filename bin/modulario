@@ -318,7 +318,7 @@ def cmd_query(target_dir):
     if cycles or private:
         print("Violations:")
         for c in cycles:
-            chain = ' → '.join(os.path.basename(p) for p in c['files'])
+            chain = '\n              → '.join(c['files'])
             print(f"  [CYCLE]   {chain}")
         for p in private:
             print(f"  [PRIVATE] {p['importer']} imports {p['member']}")
@@ -731,6 +731,97 @@ def cmd_document(argv):
         return
 
 
+AUTOSTART_DIR    = Path.home() / '.config' / 'claude-autostart'
+AUTOSTART_APPS   = AUTOSTART_DIR / 'apps.json'
+AUTOSTART_KEY    = 'mod_autostart'
+
+
+def _load_autostart_apps():
+    if not AUTOSTART_APPS.exists():
+        return {}
+    try:
+        with open(AUTOSTART_APPS) as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def _save_autostart_apps(apps):
+    AUTOSTART_DIR.mkdir(parents=True, exist_ok=True)
+    with open(AUTOSTART_APPS, 'w') as f:
+        json.dump(apps, f, indent=2)
+
+
+def cmd_autostart(argv):
+    usage = ("Usage:\n"
+             "  mod autostart <path>     Set restart script (absolute path)\n"
+             "  mod autostart on         Enable\n"
+             "  mod autostart off        Disable\n"
+             "  mod autostart status     Show current\n"
+             "  mod autostart clear      Remove entry entirely")
+
+    if not argv:
+        print(usage)
+        sys.exit(1)
+
+    sub = argv[0]
+    apps = _load_autostart_apps()
+    entry = apps.get(AUTOSTART_KEY, {})
+
+    if sub == 'status':
+        if not entry:
+            print("autostart: not configured")
+            return
+        state = 'ON ' if entry.get('enabled') else 'OFF'
+        print(f"autostart: {state}  script: {entry.get('start_cmd', '(none)')}")
+        return
+
+    if sub == 'on':
+        if not entry:
+            print("autostart: no script set. Run `mod autostart <path>` first.")
+            sys.exit(1)
+        entry['enabled'] = True
+        apps[AUTOSTART_KEY] = entry
+        _save_autostart_apps(apps)
+        print(f"autostart: ON  script: {entry.get('start_cmd', '')}")
+        return
+
+    if sub == 'off':
+        if not entry:
+            print("autostart: not configured")
+            return
+        entry['enabled'] = False
+        apps[AUTOSTART_KEY] = entry
+        _save_autostart_apps(apps)
+        print("autostart: OFF")
+        return
+
+    if sub == 'clear':
+        if AUTOSTART_KEY in apps:
+            del apps[AUTOSTART_KEY]
+            _save_autostart_apps(apps)
+            print("autostart: cleared")
+        else:
+            print("autostart: nothing to clear")
+        return
+
+    # Otherwise treat as path
+    script_path = os.path.abspath(os.path.expanduser(sub))
+    if not os.path.exists(script_path):
+        print(f"Error: script not found: {script_path}")
+        sys.exit(1)
+    if not os.access(script_path, os.X_OK):
+        print(f"Warning: {script_path} is not executable (will run via `bash`).")
+    apps[AUTOSTART_KEY] = {
+        'start_cmd': f'bash {script_path}',
+        'stop_cmd': '',
+        'enabled': entry.get('enabled', True),
+    }
+    _save_autostart_apps(apps)
+    state = 'ON ' if apps[AUTOSTART_KEY]['enabled'] else 'OFF'
+    print(f"autostart: {state}  script: bash {script_path}")
+
+
 def cmd_off():
     if CURRENT_TARGET.exists():
         CURRENT_TARGET.unlink()
@@ -768,6 +859,10 @@ def print_help():
     mod graph <file> [--target <dir>]
                             Show what a file imports and what imports it (fan-out + fan-in)
                             --target overrides the active mod directory
+    mod autostart <path>    Set the script Claude restart-hook runs on Stop
+    mod autostart on|off    Enable/disable the autostart entry
+    mod autostart status    Show current autostart script + state
+    mod autostart clear     Remove autostart entry entirely
     mod off                 Deactivate hook (stop tracking)
     mod help                This help
 
@@ -807,6 +902,10 @@ def main():
 
     if args[0] == 'graph':
         cmd_graph(args[1:])
+        return
+
+    if args[0] == 'autostart':
+        cmd_autostart(args[1:])
         return
 
     cmd_launch(args[0])

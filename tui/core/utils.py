@@ -156,7 +156,10 @@ def build_text_dump(rows, summary, last_updated, target_dir, thresholds, cell_co
         lines.append('')
         lines.append('Boundary violations:')
         for c in cycles:
-            lines.append(f"  [CYCLE] {' → '.join(p.split('/')[-1] for p in c['files'])}")
+            files = c['files']
+            lines.append(f"  [CYCLE] {files[0]}")
+            for f in files[1:]:
+                lines.append(f"       → {f}")
         for p in priv:
             lines.append(f"  [PRIV]  {p['importer']} imports {p['member']} from {p['module']}")
 
