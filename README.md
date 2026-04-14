@@ -2,12 +2,6 @@
 
 **Structural health monitoring for AI-assisted codebases.**
 
-> **What's new — 2026-04-14**
-> - **Stop-hook gate** — Claude Code can no longer end a turn while `mod watch run` is failing, cycles are detected, touched folders have unfilled `README.md`, or any file is over the LOC limit. Three fix attempts, then it releases with a forced summary.
-> - **Settings page** (`e` in the TUI) — toggle each stopgate check and edit the LOC limit live. Writes to `configs/stopgate.json`, shared with the hook.
-> - **`b` in the main view** — copy a plaintext bug report (cycles, private-API leaks, failing watches) to the clipboard.
-> - **Internal refactor** — `tui/` reorganized into `tui/core/` and `tui/views/`; the main entry point went from 820 LOC to 112. No user-facing keybinds changed.
-
 Modulario is a CLI + TUI tool that watches your project as you (and your AI coding assistant) edit it, and tells you — in real time — when files are getting too big, too tangled, or too coupled to safely keep growing. It's designed to keep AI-generated code from quietly rotting into unmaintainable sprawl.
 
 ## Why it exists
@@ -40,3 +34,10 @@ You can't ask an AI to "write maintainable code." You have to *show* it, every s
 ## Status
 
 Personal tool, actively used. Linux-first (uses `xclip`/`xsel` for clipboard, curses for the TUI). Python 3, no heavy dependencies.
+
+## What's new — 2026-04-14
+
+- **Stop-hook gate** — Claude Code can no longer end a turn while `mod watch run` is failing, cycles are detected, touched folders have unfilled `README.md`, or any file is over the LOC limit. Three fix attempts, then it releases with a forced summary.
+- **Settings page** (`e` in the TUI) — toggle each stopgate check and edit the LOC limit live. Writes to `configs/stopgate.json`, shared with the hook.
+- **`b` in the main view** — copy a plaintext bug report (cycles, private-API leaks, failing watches) to the clipboard.
+- **Internal refactor** — `tui/` reorganized into `tui/core/` and `tui/views/`; the main entry point went from 820 LOC to 112. No user-facing keybinds changed.
