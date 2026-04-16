@@ -74,20 +74,6 @@ def _band_attr(value, bands):
     return curses.color_pair(C_RED)
 
 
-def _churn_display(session_m1):
-    if session_m1 >= 0.75:
-        return f"{session_m1:>5.0%}", curses.color_pair(C_RED)    | curses.A_BOLD
-    if session_m1 >= 0.50:
-        return f"{session_m1:>5.0%}", curses.color_pair(C_RED)
-    if session_m1 >= 0.25:
-        return f"{session_m1:>5.0%}", curses.color_pair(C_ORANGE)
-    if session_m1 >= 0.10:
-        return f"{session_m1:>5.0%}", curses.color_pair(C_YELLOW)
-    if session_m1 > 0:
-        return f"{session_m1:>5.0%}", curses.A_DIM
-    return f"{'—':>5}", curses.A_DIM
-
-
 def _age_label(seconds):
     if seconds is None or seconds < 0:
         return f"{'—':>5}", curses.A_DIM
@@ -119,12 +105,11 @@ def _fan_attr(n):
 
 
 def draw_main_view(stdscr, rows, scroll_offset, summary, last_updated, target_dir, thresholds,
-                   cell_counts, flash_msg='', show_matrix=True, violations=None, churn_map=None,
+                   cell_counts, flash_msg='', show_matrix=True, violations=None,
                    folder_metrics=None, activity=None, activity_folders=None,
                    fan_in_map=None, watch_results=None):
     fan_in_map = fan_in_map or {}
     violations = violations or {}
-    churn_map  = churn_map  or {}
     watch_results = watch_results or []
     folder_metrics = folder_metrics or {}
     activity = activity or {'files': {}}
@@ -263,7 +248,7 @@ def draw_main_view(stdscr, rows, scroll_offset, summary, last_updated, target_di
 
     end_row  = min(scroll_offset + content_h, len(rows))
     pos_info = f" {scroll_offset + 1}–{end_row}/{len(rows)} "
-    hints    = " ↑↓/jk  PgUp/PgDn  g/G  r/R refresh  m matrix  w watch  l loc  d dep  U churn  L/D/S ranked  t expand  a collapse  c copy  b bugs  q quit"
+    hints    = " ↑↓/jk  PgUp/PgDn  g/G  r/R refresh  m matrix  w watch  l loc  d dep  L/D/S ranked  t expand  a collapse  c copy  b bugs  q quit"
     if flash_msg:
         safe_addstr(stdscr, h - 1, 0, flash_msg.center(w)[:w], curses.A_BOLD)
     else:

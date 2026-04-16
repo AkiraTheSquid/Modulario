@@ -14,20 +14,13 @@ Keys (main view):
   d            set DEPS interval
   c            copy to clipboard
   r            force re-analysis (re-reads state file)
-  U            open Churn Analytics view
   drop folder  switch the live target directory
   A            toggle request-activity columns + auto-open changed paths
   q / Ctrl-C   quit
 
-Keys (churn view):
-  ↑↓ / j k     scroll
-  h            cycle horizon: Session → 24h → 7d
-  U / q        return to main view
-  Ctrl-C       quit
-
 This file is intentionally thin: it wires argparse → curses.wrapper → a
 single event loop that snapshots shared state, computes a flash message,
-and dispatches to one of four view handlers. All the heavy lifting lives
+and dispatches to one of three view handlers. All the heavy lifting lives
 in core/tui_state.py, core/*.py, and views/*_handler.py.
 """
 import argparse
@@ -40,7 +33,6 @@ from types import SimpleNamespace
 
 from core.tree import all_dir_paths
 from core.tui_state import TuiState, fresh_view_state
-from views.churn_handler import handle_churn_view
 from views.display import setup_colors
 from views.main_handler import handle_main_view
 from views.ranked_handler import handle_ranked_view
@@ -49,7 +41,7 @@ from views.watch_handler import handle_watch_view
 
 _SNAP_KEYS = (
     'rows', 'summary', 'last_updated', 'target_dir', 'thresholds',
-    'cell_counts', 'violations', 'folder_metrics', 'churn_map', 'history',
+    'cell_counts', 'violations', 'folder_metrics', 'history',
     'activity', 'activity_folders', 'fan_in_map', 'watch_results',
 )
 
@@ -105,8 +97,6 @@ def run_tui(stdscr, state_path_str):
 
             if view.show_ranked:
                 handler = handle_ranked_view
-            elif view.show_churn:
-                handler = handle_churn_view
             elif view.show_watches:
                 handler = handle_watch_view
             else:

@@ -66,8 +66,6 @@ _STATUS_ORDER  = ['RED', 'ORANGE', 'YELLOW', 'LIME', 'GREEN']
 _FILE_DOT      = {'RED': '●', 'ORANGE': '◆', 'YELLOW': '◆', 'LIME': '◆', 'GREEN': '●'}
 _STATUS_LETTER = {'RED': 'R', 'ORANGE': 'O', 'YELLOW': 'Y', 'LIME': 'L', 'GREEN': 'G'}
 _DIAG_STATUS   = ['GREEN', 'LIME', 'YELLOW', 'ORANGE', 'RED']
-def _churn_pct(session_m1):
-    return f"{session_m1:.0%}" if session_m1 > 0 else '—'
 
 
 def _folder_loc_label(metric):
@@ -84,9 +82,8 @@ def _folder_bug_label(metric):
 
 
 def build_text_dump(rows, summary, last_updated, target_dir, thresholds, cell_counts,
-                    violations=None, churn_map=None, folder_metrics=None,
+                    violations=None, folder_metrics=None,
                     activity=None):
-    churn_map = churn_map or {}
     folder_metrics = folder_metrics or {}
     activity = activity or {'files': {}}
     lines = []

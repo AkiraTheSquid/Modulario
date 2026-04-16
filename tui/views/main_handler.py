@@ -33,7 +33,7 @@ def handle_main_view(stdscr, state, view, snap, dirty, flash_msg, h):
     if dirty:
         draw_main_view(stdscr, snap.rows, view.scroll, snap.summary, snap.last_updated,
                        snap.target_dir, snap.thresholds, snap.cell_counts, flash_msg,
-                       view.show_matrix, snap.violations, snap.churn_map, snap.folder_metrics,
+                       view.show_matrix, snap.violations, snap.folder_metrics,
                        activity=snap.activity, activity_folders=snap.activity_folders,
                        fan_in_map=snap.fan_in_map, watch_results=snap.watch_results)
 
@@ -43,9 +43,6 @@ def handle_main_view(stdscr, state, view, snap, dirty, flash_msg, h):
 
     if key in (ord('q'), ord('Q'), 27, 3):
         return 'break'
-    elif key in (ord('U'), ord('u')):
-        view.show_churn = True
-        view.churn_scroll = 0
     elif key == ord('L'):
         view.show_ranked = True; view.ranked_sort = 'loc';      view.ranked_scroll = 0
     elif key == ord('D'):
@@ -188,9 +185,9 @@ def _handle_copy(state):
         _rows = list(data['rows']); _summary = data['summary']
         _lu   = data['last_updated']; _td = data['target_dir']
         _th   = data['thresholds']; _cc = data['cell_counts']
-        _viol = data['violations']; _cm = data['churn_map']; _fm = data['folder_metrics']
+        _viol = data['violations']; _fm = data['folder_metrics']
         _activity = data['activity']
-    text = build_text_dump(_rows, _summary, _lu, _td, _th, _cc, _viol, _cm, _fm, _activity)
+    text = build_text_dump(_rows, _summary, _lu, _td, _th, _cc, _viol, _fm, _activity)
     ok, msg = copy_to_clipboard(text)
     with lock:
         data['flash'] = (msg, time.time())

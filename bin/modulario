@@ -4,7 +4,6 @@ mod — structural health monitor
 
   mod <directory>         Analyze directory, activate Claude hook, show live TUI
   mod query <directory>   CLI-only analysis — no TUI (for Claude agent use)
-  mod churn ...           Per-file churn warning controls
   mod doc ...             Auto folder documentation
   mod off                 Clear current target (disable hook)
   mod help                Show this help
@@ -64,8 +63,9 @@ def ensure_global_hook():
 
 
 def ensure_codex_hook():
-    """Write the global Codex hook entry into ~/.codex/hooks.json once."""
+    """Write the global Codex hook entries into ~/.codex/hooks.json once."""
     hook_cmd = str(HOOK_SCRIPT)
+    stop_cmd = f"{sys.executable} {MODULARIO_DIR / 'scripts' / 'stop_gate.py'}"
     CODEX_HOOKS.parent.mkdir(parents=True, exist_ok=True)
 
     settings = {}
@@ -82,6 +82,13 @@ def ensure_codex_hook():
         post_hooks.append({
             'matcher': 'Write|Edit|NotebookEdit',
             'hooks': [{'type': 'command', 'command': hook_cmd, 'timeout': 20}],
+        })
+
+    stop_hooks = hooks.setdefault('Stop', [])
+    if not any(any(h.get('command') == stop_cmd for h in e.get('hooks', [])) for e in stop_hooks):
+        stop_hooks.append({
+            'matcher': '',
+            'hooks': [{'type': 'command', 'command': stop_cmd, 'timeout': 20}],
         })
 
     with open(CODEX_HOOKS, 'w') as f:
@@ -175,72 +182,6 @@ def resolve_target_folder(folder_arg):
     if rel_path == '.':
         return target, '/'
     return target, rel_path.rstrip('/') + '/'
-
-
-
-def cmd_churn(argv):
-    parser = argparse.ArgumentParser(prog='mod churn', add_help=True)
-    subparsers = parser.add_subparsers(dest='churn_cmd', required=True)
-
-    p_disable = subparsers.add_parser('disable', help='Disable churn warnings for one file')
-    p_disable.add_argument('file')
-
-    p_raise = subparsers.add_parser('raise', help='Raise churn thresholds for one file')
-    p_raise.add_argument('file')
-    p_raise.add_argument('--high', type=float, required=True, help='New HIGH churn score threshold')
-    p_raise.add_argument('--critical', type=float, help='New CRITICAL churn score threshold')
-
-    p_enable = subparsers.add_parser('enable', help='Re-enable churn warnings for one file')
-    p_enable.add_argument('file')
-
-    p_show = subparsers.add_parser('show', help='Show file-specific churn rules')
-
-    args = parser.parse_args(argv)
-    data = load_thresholds_config()
-    rules = data.setdefault('churn_file_rules', {})
-
-    if args.churn_cmd == 'show':
-        if not rules:
-            print("No file-specific churn rules.")
-            return
-        print("File-specific churn rules:")
-        for path in sorted(rules):
-            print(f"  {path}: {rules[path]}")
-        return
-
-    _, rel_path = resolve_target_file(args.file)
-
-    if args.churn_cmd == 'disable':
-        rules[rel_path] = {'disabled': True}
-        save_thresholds_config(data)
-        print(f"Disabled churn warnings for {rel_path}")
-        return
-
-    if args.churn_cmd == 'enable':
-        if rel_path in rules:
-            del rules[rel_path]
-            save_thresholds_config(data)
-            print(f"Removed churn override for {rel_path}")
-        else:
-            print(f"No churn override exists for {rel_path}")
-        return
-
-    if args.churn_cmd == 'raise':
-        if args.high <= 0:
-            print("--high must be > 0")
-            sys.exit(1)
-        critical = args.critical if args.critical is not None else max(args.high + 1, args.high * 1.5)
-        if critical <= args.high:
-            print("--critical must be greater than --high")
-            sys.exit(1)
-        rules[rel_path] = {
-            'disabled': False,
-            'high': args.high,
-            'critical': critical,
-        }
-        save_thresholds_config(data)
-        print(f"Raised churn thresholds for {rel_path}: high={args.high}, critical={critical}")
-        return
 
 
 
@@ -822,6 +763,64 @@ def cmd_autostart(argv):
     print(f"autostart: {state}  script: bash {script_path}")
 
 
+def cmd_end_attempt(argv):
+    """Escape hatch: mark the most recent stop-gate session as released so the
+    next Stop hook allows immediately. Requires a reason — logged to
+    logs/escape_attempts.jsonl so the user can audit.
+    """
+    import sys as _sys
+    sys.path.insert(0, str(MODULARIO_DIR / 'scripts'))
+    import stopgate_config
+
+    if not stopgate_config.load().get('claude', {}).get('escape_hatch', True):
+        print("mod end-attempt: escape hatch is disabled in settings.", file=_sys.stderr)
+        _sys.exit(1)
+
+    if not argv:
+        print('Usage: mod end-attempt "<reason>"', file=_sys.stderr)
+        print("Reason is required — explain why the stop-gate cycle should end.", file=_sys.stderr)
+        _sys.exit(1)
+    reason = " ".join(argv).strip()
+    if not reason:
+        print("mod end-attempt: reason cannot be empty.", file=_sys.stderr)
+        _sys.exit(1)
+
+    tmp_dir = MODULARIO_DIR / 'tmp'
+    candidates = sorted(
+        tmp_dir.glob('stop_retries_*.json'),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    ) if tmp_dir.exists() else []
+    if not candidates:
+        print("mod end-attempt: no active stop-gate session found.", file=_sys.stderr)
+        _sys.exit(1)
+    target_file = candidates[0]
+
+    try:
+        state = json.loads(target_file.read_text())
+    except Exception:
+        state = {}
+    state['final_shown'] = True
+    state['escaped'] = True
+    state['escape_reason'] = reason
+    target_file.write_text(json.dumps(state))
+
+    session_id = target_file.stem.replace('stop_retries_', '')
+    logs_dir = MODULARIO_DIR / 'logs'
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    log_entry = {
+        'timestamp': datetime.now().isoformat(),
+        'session_id': session_id,
+        'reason': reason,
+    }
+    with open(logs_dir / 'escape_attempts.jsonl', 'a') as fh:
+        fh.write(json.dumps(log_entry) + '\n')
+
+    print(f"Stop-gate released for session {session_id}.")
+    print(f"Reason logged: {reason}")
+    print("Next Stop attempt will allow immediately.")
+
+
 def cmd_off():
     if CURRENT_TARGET.exists():
         CURRENT_TARGET.unlink()
@@ -837,12 +836,6 @@ def print_help():
   Usage:
     mod <directory>         Analyze and show live TUI
     mod query <directory>   CLI report only — no TUI (for Claude agent use)
-    mod churn show          Show file-specific churn rules
-    mod churn disable <file>
-                            Disable churn warning for one file in current target
-    mod churn raise <file> --high N [--critical N]
-                            Raise churn thresholds for one file in current target
-    mod churn enable <file> Remove file-specific churn override
     mod watch run           Run all enabled watch.py scripts
     mod watch status        Show watch.py status for all folders
     mod watch init <folder> Create a watch.py template in a folder
@@ -863,6 +856,11 @@ def print_help():
     mod autostart on|off    Enable/disable the autostart entry
     mod autostart status    Show current autostart script + state
     mod autostart clear     Remove autostart entry entirely
+    mod end-attempt "<reason>"
+                            Release the current stop-gate session without more
+                            retries. For Claude to use when a watch/doc failure
+                            is outside the scope of what the user asked it to do.
+                            Reason is required and is logged to logs/escape_attempts.jsonl.
     mod off                 Deactivate hook (stop tracking)
     mod help                This help
 
@@ -884,10 +882,6 @@ def main():
         cmd_query(args[1])
         return
 
-    if args[0] == 'churn':
-        cmd_churn(args[1:])
-        return
-
     if args[0] == 'off':
         cmd_off()
         return
@@ -906,6 +900,10 @@ def main():
 
     if args[0] == 'autostart':
         cmd_autostart(args[1:])
+        return
+
+    if args[0] in ('end-attempt', 'end_attempt'):
+        cmd_end_attempt(args[1:])
         return
 
     cmd_launch(args[0])

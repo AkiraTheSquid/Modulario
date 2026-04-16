@@ -1,8 +1,8 @@
 """State file I/O + analyzer invocation for the Modulario TUI.
 
 Pulled out of modulario-tui.py to keep the entry point focused on event-loop
-orchestration. These helpers read/write the on-disk state.json, _churn.json,
-and _history.jsonl produced by `modulario-analyze.py`, and re-run the analyzer
+orchestration. These helpers read/write the on-disk state.json and
+_history.jsonl produced by `modulario-analyze.py`, and re-run the analyzer
 when the user edits LOC/DEPS thresholds at runtime.
 """
 import hashlib
@@ -52,22 +52,9 @@ def load_state(path):
         return None
 
 
-def _churn_path(state_path_str):
-    stem = state_path_str[:-5] if state_path_str.endswith('.json') else state_path_str
-    return stem + '_churn.json'
-
-
 def _history_path(state_path_str):
     stem = state_path_str[:-5] if state_path_str.endswith('.json') else state_path_str
     return stem + '_history.jsonl'
-
-
-def load_churn(state_path_str):
-    try:
-        with open(_churn_path(state_path_str)) as f:
-            return json.load(f).get('files', {})
-    except Exception:
-        return {}
 
 
 def load_history(state_path_str):

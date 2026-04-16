@@ -2,7 +2,7 @@
 # Modulario install script
 # 1. Checks Python deps (installs if missing)
 # 2. Asks for target project directory
-# 3. Writes PostToolUse hooks into Claude and Codex settings
+# 3. Writes PostToolUse hooks into Claude and Codex settings, plus Codex Stop
 # 4. Runs initial analysis pass
 
 set -euo pipefail
@@ -14,6 +14,7 @@ THRESHOLDS="$MODULARIO_DIR/configs/thresholds.json"
 STATE_FILE="$MODULARIO_DIR/data/state.json"
 TARGET_CONFIG="$MODULARIO_DIR/configs/target.txt"
 CODEX_HOOKS="$HOME/.codex/hooks.json"
+STOP_GATE_CMD="python3 $MODULARIO_DIR/scripts/stop_gate.py"
 
 echo ""
 echo "╔══════════════════════════════════════════════╗"
@@ -147,7 +148,7 @@ echo ""
 echo "Installing Codex hook into: $CODEX_HOOKS"
 mkdir -p "$(dirname "$CODEX_HOOKS")"
 
-python3 - "$CODEX_HOOKS" "$HOOK_SCRIPT" <<'PYEOF'
+STOP_GATE_CMD="$STOP_GATE_CMD" python3 - "$CODEX_HOOKS" "$HOOK_SCRIPT" <<'PYEOF'
 import json
 import os
 import sys
@@ -164,7 +165,9 @@ if os.path.exists(hooks_file):
 else:
     settings = {}
 
-post_hooks = settings.setdefault("hooks", {}).setdefault("PostToolUse", [])
+hooks = settings.setdefault("hooks", {})
+post_hooks = hooks.setdefault("PostToolUse", [])
+stop_hooks = hooks.setdefault("Stop", [])
 
 already_installed = any(
     any(h.get("command") == hook_cmd for h in entry.get("hooks", []))
@@ -188,6 +191,30 @@ else:
         json.dump(settings, f, indent=2)
         f.write("\n")
     print(f"  ✓ Hook added to {hooks_file}")
+
+stop_cmd = os.environ["STOP_GATE_CMD"]
+stop_installed = any(
+    any(h.get("command") == stop_cmd for h in entry.get("hooks", []))
+    for entry in stop_hooks
+)
+
+if stop_installed:
+    print(f"  Stop hook already present in {hooks_file}")
+else:
+    stop_hooks.append({
+        "matcher": "",
+        "hooks": [
+            {
+                "type": "command",
+                "command": stop_cmd,
+                "timeout": 20
+            }
+        ]
+    })
+    with open(hooks_file, "w") as f:
+        json.dump(settings, f, indent=2)
+        f.write("\n")
+    print(f"  ✓ Stop hook added to {hooks_file}")
 
 PYEOF
 

@@ -22,7 +22,7 @@ from types import SimpleNamespace
 from core.activity import (activity_from_diff, build_activity_folder_metrics,
                            empty_activity, snapshot_files)
 from core.config import ANALYZER_PATH, THRESHOLDS_PATH
-from core.state_io import (analyze_target, load_churn, load_history, load_state,
+from core.state_io import (analyze_target, load_history, load_state,
                            state_path_for)
 from core.tree import all_dir_paths, build_folder_metrics, flatten_tree
 from core.utils import StateWatcher
@@ -34,7 +34,7 @@ def _fresh_data():
     return {
         'rows': [], 'files': [], 'summary': {}, 'last_updated': '', 'target_dir': '',
         'thresholds': {}, 'cell_counts': [[0] * 5 for _ in range(5)],
-        'violations': {}, 'churn_map': {}, 'history': [],
+        'violations': {}, 'history': [],
         'import_graph': {}, 'fan_in_map': {}, 'folder_metrics': {},
         'activity': empty_activity(), 'activity_folders': {},
         'watch_entries': [], 'watch_results': [],
@@ -65,7 +65,6 @@ def _cell_counts(files, thresholds):
 def fresh_view_state():
     return SimpleNamespace(
         scroll=0, show_matrix=True,
-        show_churn=False, churn_scroll=0, churn_horizon=0,
         show_ranked=False, ranked_sort='loc', ranked_scroll=0,
         show_watches=False, watch_scroll=0, watch_cursor=0,
     )
@@ -112,7 +111,6 @@ class TuiState:
                 for dep in deps:
                     fan_in[dep] = fan_in.get(dep, 0) + 1
             data['fan_in_map']   = fan_in
-            data['churn_map']    = load_churn(self.current_state_path)
             data['history']      = load_history(self.current_state_path)
             target = data['target_dir']
             watch_entries = scan_watches(target) if target else []
@@ -186,7 +184,6 @@ class TuiState:
             self.data['flash'] = (f"Switched to {detail}", time.time())
             self.data['dirty'] = True
         view.scroll = 0
-        view.churn_scroll = 0
         view.ranked_scroll = 0
         return True, detail
 

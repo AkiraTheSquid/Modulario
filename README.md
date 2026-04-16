@@ -10,20 +10,18 @@ When you code with an AI assistant, the assistant has no long-term memory of you
 
 - Keep stuffing logic into the same file because that's where the last edit happened
 - Add imports until a single module depends on half the codebase
-- Reintroduce bugs in files it's edited dozens of times because nothing flagged the churn
 - Drift away from the folder structure you originally designed
 - Skip writing docs and health checks for new folders entirely
 
-Modulario is the missing feedback loop. Every time a file is written, it scores the file on a LOC × DEPS diagonal (GREEN → LIME → YELLOW → ORANGE → RED), tracks churn over time, detects circular imports and boundary violations, and pipes the result back to the AI through a hook so the assistant sees the structural consequences of its own edits *immediately* — not three weeks later when you wonder why everything broke.
+Modulario is the missing feedback loop. Every time a file is written, it scores the file on a LOC × DEPS diagonal (GREEN → LIME → YELLOW → ORANGE → RED), detects circular imports and boundary violations, and pipes the result back to the AI through a hook so the assistant sees the structural consequences of its own edits *immediately* — not three weeks later when you wonder why everything broke.
 
 ## What it gives you
 
 - **Real-time structural feedback** after every file edit, surfaced directly to Claude Code / Codex via PostToolUse hooks
-- **A live TUI** showing every file's status, the worst hotspots, recent churn, and folder-level health
+- **A live TUI** showing every file's status, the worst hotspots, and folder-level health
 - **Auto-generated `README.md` and `watch.py`** templates in every folder, with persistent nags until they're filled in — so documentation and folder-level health checks actually get written
 - **In-the-loop watch.py feedback for Claude Code** — once you fill in a folder's `watch.py`, it runs *between Claude Code's tool calls* via the PostToolUse hook, so a broken import or violated invariant is surfaced to Claude *before its next edit*, not after the session ends. This is the killer feature, and it's why **Claude Code is the recommended frontend** — Codex's hook model doesn't feed results back into the assistant's context the same way, so the live feedback loop is much weaker there
 - **Boundary violation detection** — circular imports and private-API leaks across module boundaries
-- **Churn tracking** — flags files that keep getting touched session after session (the real bug magnets)
 - **Import graph queries** (`mod graph <file>`) — fan-in and fan-out before you rename or split anything
 - **Folder watch scripts** — per-folder health checks that run on every edit and fail loudly when an invariant breaks
 

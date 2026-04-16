@@ -145,7 +145,7 @@ def oversized_files_all(active_target, loc_limit):
     active_real = os.path.realpath(active_target)
     for state_path in sorted(STATE_DIR.glob("*.json")):
         name = state_path.name
-        if name.endswith("_touched.json") or name.endswith("_churn.json") or name.endswith("_coupling.json"):
+        if name.endswith("_touched.json") or name.endswith("_coupling.json"):
             continue
         try:
             data = json.loads(state_path.read_text())
@@ -235,7 +235,11 @@ def main():
 
     cfg = stopgate_config.load()
     enabled = cfg["enabled"]
+    claude_cfg = cfg.get("claude", {})
     loc_limit = cfg["loc_limit"]
+
+    if not claude_cfg.get("gate_master", True):
+        allow()
 
     if enabled.get("watches", True):
         watch_exit, watch_out = run_watches()
@@ -293,10 +297,24 @@ def main():
         if oversized:
             fix_instructions.append(f"split files over {loc_limit} LOC listed above")
         fix_line = "; ".join(fix_instructions) if fix_instructions else "resolve the issues above"
+        escape_line = ""
+        if claude_cfg.get("escape_hatch", True):
+            escape_line = (
+                "\n\nEscape hatch: if the failures above are OUTSIDE the scope of what "
+                "the user asked you to do (e.g. a pre-existing broken watch, an unfilled "
+                "README for a folder the user never touched, an oversized file you never "
+                "edited), do NOT spend retries fixing unrelated work. Instead:\n"
+                "  1. In your final message, explain WHY the failures are out of scope and "
+                "what you would have had to change to fix them.\n"
+                "  2. Then run:  mod end-attempt \"<one-sentence reason>\"\n"
+                "  3. Then end your turn normally. The next Stop will allow immediately.\n"
+                "Only use the escape hatch when the failures genuinely don't belong to your "
+                "current task — not to skip fixing real bugs you introduced."
+            )
         reason = (
             f"Stop blocked by Modulario (fix attempt {state['count']}/{MAX_FIX_ATTEMPTS}).\n\n"
             f"{detail}\n\n"
-            f"Next: {fix_line}, then try to stop again."
+            f"Next: {fix_line}, then try to stop again.{escape_line}"
         )
         block(reason)
     else:

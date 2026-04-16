@@ -1,0 +1,24 @@
+{
+  "enabled": {
+    "watches": true,
+    "cycles": true,
+    "unfilled_docs": true,
+    "oversized_files": true
+  },
+  "claude": {
+    "gate_master": true,
+    "summary_block": true,
+    "red_hotspots": true,
+    "threshold_alerts": true,
+    "violation_alerts": true,
+    "import_alerts": true,
+    "coupling_alerts": true,
+    "doc_nag": true,
+    "watch_nag": true,
+    "auto_create_readme": true,
+    "auto_create_watch": true,
+    "escape_hatch": true
+  },
+  "loc_limit": 700,
+  "notify_loc": 650
+}

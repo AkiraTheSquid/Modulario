@@ -21,8 +21,8 @@ from counters import (count_loc_python, count_loc_js, count_loc_css,
 from violations import (collect_graph_data, find_violations,
                         file_in_violations, format_violation_block)
 from import_alerts import build_import_alerts
-from churn_tracker import churn_paths, append_history, update_churn
 from coupling_tracker import coupling_path, update_coupling, find_strong_pairs, interpret_coupling
+import stopgate_config
 
 SKIP_DIRS = {
     'node_modules', '.git', 'venv', '.venv', '__pycache__',
@@ -86,14 +86,6 @@ def load_thresholds(path):
         "loc_bands":  [150, 300, 450, 600, 750],
         "deps_bands": [4, 8, 12, 16, 20],
         "violation_ignore": [],
-        "churn_window": 20,
-        "churn_thresholds": {"high": 5, "critical": 8},
-        "churn_scoring": {
-            "day_weight": 1.0,
-            "span_day_weight": 0.2,
-            "same_day_repeat_weight": 0.25,
-        },
-        "churn_file_rules": {},
         "coupling_window": 30,
         "coupling_min_sessions": 20,
         "coupling_min_count": 5,
@@ -109,7 +101,6 @@ def load_thresholds(path):
                 loaded = json.load(f)
                 for k in (
                     "loc_bands", "deps_bands", "violation_ignore",
-                    "churn_window", "churn_thresholds", "churn_scoring", "churn_file_rules",
                     "coupling_window", "coupling_min_sessions",
                     "coupling_min_count", "coupling_thresholds",
                 ):
@@ -256,49 +247,40 @@ def relativize_import_graph(import_graph, target_dir):
 
 
 
-def write_churn_warning_log(modulario_dir, changed_stats, churn_info, window):
-    """Create a dated review note for each churn warning."""
-    logs_root = Path(modulario_dir) / 'logs' / 'churn-warnings'
-    now = datetime.now()
-    date_dir = logs_root / now.strftime('%Y-%m-%d')
-    date_dir.mkdir(parents=True, exist_ok=True)
+# ─── History helper ──────────────────────────────────────────────────────────
 
-    file_slug = changed_stats['path'].replace(os.sep, '__').replace('/', '__')
-    file_slug = ''.join(ch for ch in file_slug if ch.isalnum() or ch in ('-', '_', '.'))
-    log_path = date_dir / f"{now.strftime('%H%M%S')}_{file_slug}.txt"
+def _history_path_for(output_path):
+    stem = output_path[:-5] if output_path.endswith('.json') else output_path
+    return stem + '_history.jsonl'
 
-    body = "\n".join([
-        "Modulario churn warning review",
-        f"Generated: {now.isoformat()}",
-        f"File: {changed_stats['path']}",
-        f"Status: {churn_info.get('churn_status', 'LOW')}",
-        f"Weighted churn score: {churn_info.get('churn_score', 0)}",
-        f"Sessions touched: {churn_info.get('sessions_touched', 0)}/{window}",
-        f"Distinct days touched: {churn_info.get('days_touched', 0)}",
-        f"Touch span days: {churn_info.get('touch_span_days', 0)}",
-        f"Same-day retouches: {churn_info.get('same_day_retouches', 0)}",
-        f"Relative churn: {churn_info.get('relative_churn', 0.0)}",
-        "",
-        "AI review:",
-        "Classification: PENDING",
-        "False positive?: PENDING",
-        "Hidden legacy/setup artifacts to inspect:",
-        "- ",
-        "Reasoning:",
-        "- ",
-        "Suggested cleanup or structural follow-up:",
-        "- ",
-    ]) + "\n"
 
-    with open(log_path, 'w', encoding='utf-8') as fh:
-        fh.write(body)
-    return log_path
+def append_history(history_path, ts, old_files, new_files):
+    """Append LOC deltas to history.jsonl. Used by coupling tracker."""
+    if not old_files:
+        return
+    old_loc = {f['path']: f['loc'] for f in old_files}
+    changed = []
+    deltas  = {}
+    for f in new_files:
+        old = old_loc.get(f['path'])
+        if old is not None and f['loc'] != old:
+            changed.append(f['path'])
+            deltas[f['path']] = f['loc'] - old
+    if not changed:
+        return
+    line = json.dumps({'ts': ts, 'changed': changed, 'deltas': deltas})
+    try:
+        with open(history_path, 'a', encoding='utf-8') as fh:
+            fh.write(line + '\n')
+    except OSError:
+        pass
 
 
 # ─── Summary for Claude (PostToolUse) ────────────────────────────────────────
 
-def build_claude_summary(state, changed_file, thresholds, churn_data=None, history=None,
-                         coupling_data=None, modulario_dir=None):
+def build_claude_summary(state, changed_file, thresholds, history=None,
+                         coupling_data=None, modulario_dir=None, claude_cfg=None):
+    cc = claude_cfg or {}
     files      = state['files']
     summary    = state['summary']
     violations = state.get('violations', {})
@@ -329,12 +311,13 @@ def build_claude_summary(state, changed_file, thresholds, churn_data=None, histo
         )
     else:
         lines.append(f"│ {changed_name:<38}  (not in target directory)              │")
-    lines.append("├─ Red hotspots ──────────────────────────────────┤")
-    if red_files:
-        for f in red_files[:5]:
-            lines.append(f"│ {f['path'][-38:]:<38}  LOC:{f['loc']:>4}  DEPS:{f['deps']:>3}                   │")
-    else:
-        lines.append("│ None — all files within thresholds.             │")
+    if cc.get("red_hotspots", True):
+        lines.append("├─ Red hotspots ──────────────────────────────────┤")
+        if red_files:
+            for f in red_files[:5]:
+                lines.append(f"│ {f['path'][-38:]:<38}  LOC:{f['loc']:>4}  DEPS:{f['deps']:>3}                   │")
+        else:
+            lines.append("│ None — all files within thresholds.             │")
     lines.append("├─ Session totals ────────────────────────────────┤")
     lines.append(
         f"│ Red:{summary.get('red',0):<3} Org:{summary.get('orange',0):<3} Yel:{summary.get('yellow',0):<3}"
@@ -342,7 +325,7 @@ def build_claude_summary(state, changed_file, thresholds, churn_data=None, histo
     )
     lines.append("└─────────────────────────────────────────────────┘")
 
-    if changed_stats:
+    if changed_stats and cc.get("threshold_alerts", True):
         s          = changed_stats
         name       = os.path.basename(s['path'])
         loc_bands  = thresholds['loc_bands']
@@ -356,56 +339,16 @@ def build_claude_summary(state, changed_file, thresholds, churn_data=None, histo
         elif s['deps'] > deps_bands[0]:
             lines.append(f"[!] {name}: DEPS {s['deps']} is medium ({deps_bands[0]+1}–{deps_bands[-1]}).")
 
-    for c in violations.get('cycles', [])[:2]:
-        files = c['files']
-        lines.append(f"[VIOLATION] Circular import: {files[0]}")
-        for f in files[1:]:
-            lines.append(f"                          → {f}")
-    for p in violations.get('private', [])[:2]:
-        lines.append(f"[VIOLATION] Private access: {p['importer']} imports {p['member']}")
+    if cc.get("violation_alerts", True):
+        for c in violations.get('cycles', [])[:2]:
+            files = c['files']
+            lines.append(f"[VIOLATION] Circular import: {files[0]}")
+            for f in files[1:]:
+                lines.append(f"                          → {f}")
+        for p in violations.get('private', [])[:2]:
+            lines.append(f"[VIOLATION] Private access: {p['importer']} imports {p['member']}")
 
-    if churn_data:
-        window      = churn_data.get('window_size', 20)
-        total_files = len(state['files'])
-
-        # ── Session spread: warn if this session touched a large fraction of the project
-        s_touched = churn_data.get('session_files_touched', 0)
-        if s_touched >= 5 and s_touched / max(total_files, 1) >= 0.20:
-            spread_pct = s_touched / total_files
-            lines.append(
-                f"[~] Session spread: {s_touched}/{total_files} files touched"
-                f" ({spread_pct:.0%} of project). Consider narrowing task scope."
-            )
-
-        if changed_stats:
-            path = changed_stats['path']
-            name = os.path.basename(path)
-            cd   = churn_data.get('files', {}).get(path, {})
-            st   = cd.get('sessions_touched', 0)
-            dt   = cd.get('days_touched', 0)
-            span = cd.get('touch_span_days', 0)
-            score = cd.get('churn_score', 0)
-            cs   = cd.get('churn_status', 'LOW')
-            if cs in ('HIGH', 'CRITICAL'):
-                log_path = None
-                if modulario_dir:
-                    try:
-                        log_path = write_churn_warning_log(modulario_dir, changed_stats, cd, window)
-                    except OSError:
-                        log_path = None
-                lines.append(
-                    f"[churn] {name} shows sustained churn: score {score} from {dt} active day(s),"
-                    f" {span} day span, {st}/{window} touched sessions ({cs})."
-                    f" Ask the user whether this file has hidden legacy setup, stale artifacts,"
-                    f" or structural leftovers from direction changes before deciding to split it."
-                )
-                if log_path:
-                    lines.append(
-                        f"[churn-log] Update {log_path} and record whether this churn warning"
-                        f" looks like a TRUE POSITIVE or FALSE POSITIVE."
-                    )
-
-    if coupling_data and changed_stats:
+    if coupling_data and changed_stats and cc.get("coupling_alerts", True):
         session_count = coupling_data.get('session_count', 0)
         min_sessions  = thresholds.get('coupling_min_sessions', 20)
         min_count     = thresholds.get('coupling_min_count', 5)
@@ -430,7 +373,7 @@ def build_claude_summary(state, changed_file, thresholds, churn_data=None, histo
     return '\n'.join(lines)
 
 
-def build_threshold_alerts(state, changed_file, thresholds):
+def build_threshold_alerts(state, changed_file, thresholds, notify_loc=None):
     """Return hard-threshold alerts for the changed file."""
     if not changed_file:
         return []
@@ -447,6 +390,12 @@ def build_threshold_alerts(state, changed_file, thresholds):
     loc_max = thresholds['loc_bands'][-1]
     deps_max = thresholds['deps_bands'][-1]
     name = changed_stats['path']
+
+    if notify_loc and changed_stats['loc'] > notify_loc:
+        alerts.append(
+            f"[!] {name}: LOC {changed_stats['loc']} exceeds notify threshold ({notify_loc}). "
+            f"Consider splitting before it hits the hard limit."
+        )
 
     if changed_stats.get('status') == 'RED':
         alerts.append(
@@ -475,13 +424,9 @@ def main():
     parser.add_argument('--print-summary',  action='store_true', help='Print Claude-facing summary')
     parser.add_argument('--check-violations', action='store_true',
                         help='Exit code 2 if changed file is in a violation')
-    parser.add_argument('--churn-window',   type=int, default=None,
-                        help='Rolling window size for churn (overrides thresholds.json)')
     args = parser.parse_args()
 
     thresholds = load_thresholds(args.thresholds)
-    if args.churn_window is not None:
-        thresholds['churn_window'] = args.churn_window
 
     old_files = []
     if os.path.exists(args.output):
@@ -514,9 +459,8 @@ def main():
     with open(args.output, 'w') as f:
         json.dump(state, f, indent=2)
 
-    history_path, churn_path = churn_paths(args.output)
+    history_path = _history_path_for(args.output)
     append_history(history_path, state['last_updated'], old_files, files)
-    churn_data = update_churn(churn_path, history_path, files, thresholds)
 
     history = []
     try:
@@ -532,7 +476,7 @@ def main():
         pass
 
     coup_path     = coupling_path(args.output)
-    coupling_data = update_coupling(coup_path, history, churn_data, thresholds)
+    coupling_data = update_coupling(coup_path, history, thresholds)
 
     changed_file = args.changed_file or ''
     if args.check_violations and file_in_violations(changed_file, violations):
@@ -540,6 +484,8 @@ def main():
         sys.exit(2)
 
     touched_folders = update_touched_folders(args.output, args.target, changed_file)
+
+    claude_cfg = stopgate_config.load().get("claude", {})
 
     # ── Auto-doc: ensure every folder has a README.md, nag if unfilled ──────
     TEMPLATE_MARKER = '<!-- modulario:template -->'
@@ -562,6 +508,8 @@ def main():
             continue
         readme = os.path.join(folder_abs, 'README.md')
         if not os.path.exists(readme):
+            if not claude_cfg.get("auto_create_readme", True):
+                continue
             # Auto-create template
             folder_name = folder.split('/')[-1]
             template = f"""{TEMPLATE_MARKER}
@@ -631,6 +579,8 @@ def main():
     # Gate nags to touched folders only (persistent, per target)
     unfilled = [f for f in unfilled if f in touched_folders]
 
+    if not claude_cfg.get("doc_nag", True):
+        unfilled = []
     # Nag about unfilled docs — pick the one closest to the changed file
     if unfilled and changed_file:
         changed_rel = changed_file
@@ -668,6 +618,8 @@ def main():
             continue
         watch_file = os.path.join(folder_abs, 'watch.py')
         if not os.path.exists(watch_file):
+            if not claude_cfg.get("auto_create_watch", True):
+                continue
             folder_name = folder.split('/')[-1]
             depth = len(folder.split('/'))
             parents = '/'.join(['..'] * depth)
@@ -728,6 +680,8 @@ if __name__ == '__main__':
                 pass
 
     unfilled_watches = [f for f in unfilled_watches if f in touched_folders]
+    if not claude_cfg.get("watch_nag", True):
+        unfilled_watches = []
 
     if unfilled_watches and changed_file:
         changed_rel = changed_file
@@ -753,13 +707,20 @@ if __name__ == '__main__':
                 f"[WATCH] {remaining} other folder(s) also have unfilled watch.py templates."
             )
 
-    if args.print_summary:
+    if args.print_summary and claude_cfg.get("summary_block", True):
         text = build_claude_summary(
-            state, changed_file, thresholds, churn_data, history, coupling_data,
+            state, changed_file, thresholds, history, coupling_data,
             modulario_dir=Path(__file__).resolve().parent.parent,
+            claude_cfg=claude_cfg,
         )
-        alerts = build_threshold_alerts(state, changed_file, thresholds)
-        alerts += build_import_alerts(state, changed_file, args.target)
+        alerts = []
+        if claude_cfg.get("threshold_alerts", True):
+            alerts += build_threshold_alerts(
+                state, changed_file, thresholds,
+                notify_loc=stopgate_config.load().get("notify_loc"),
+            )
+        if claude_cfg.get("import_alerts", True):
+            alerts += build_import_alerts(state, changed_file, args.target)
         alerts += doc_reminders
         alerts += watch_reminders
         if alerts:

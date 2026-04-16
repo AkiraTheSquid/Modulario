@@ -21,6 +21,23 @@ _FEATURE_LABELS = [
     ("oversized_files", "Oversized files      ", "Block when any file exceeds the Max LOC limit"),
 ]
 
+# Agent-facing feature toggles. Stored under cfg["claude"] for backward
+# compatibility with existing configs.
+_CLAUDE_LABELS = [
+    ("gate_master",        "Stop gate (master)   ", "Master switch: block Claude/Codex from ending its turn"),
+    ("summary_block",      "PostToolUse summary  ", "Emit [Modulario] block after every tool call"),
+    ("red_hotspots",       "Red hotspots         ", "Show red-zone files inside the summary block"),
+    ("threshold_alerts",   "Threshold alerts     ", "[!] LOC/DEPS warnings for the changed file"),
+    ("violation_alerts",   "Violation alerts     ", "[VIOLATION] cycle / private-access lines"),
+    ("import_alerts",      "Import alerts        ", "Warnings from import_alerts.py"),
+    ("coupling_alerts",    "Coupling alerts      ", "[coupling] co-change suggestions"),
+    ("doc_nag",            "Doc nag              ", "[DOC] reminders for unfilled README.md"),
+    ("watch_nag",          "Watch nag            ", "[WATCH] reminders for unfilled watch.py"),
+    ("auto_create_readme", "Auto-create README   ", "Drop README.md template into every folder"),
+    ("auto_create_watch",  "Auto-create watch.py ", "Drop watch.py template into every folder"),
+    ("escape_hatch",       "Escape hatch         ", "Let Claude/Codex run `mod end-attempt` to bypass retries"),
+]
+
 
 def _safe(win, y, x, s, attr=0):
     h, w = win.getmaxyx()
@@ -54,6 +71,15 @@ def _prompt_int(stdscr, label, current):
     return int(raw)
 
 
+def _draw_row(stdscr, y, mark_on, label, desc, selected):
+    attr = curses.A_REVERSE if selected else 0
+    color = curses.color_pair(_C_GREEN) if mark_on else curses.color_pair(_C_RED)
+    mark = "[X]" if mark_on else "[ ]"
+    _safe(stdscr, y, 2, mark, color | attr | curses.A_BOLD)
+    _safe(stdscr, y, 6, label, attr | curses.A_BOLD)
+    _safe(stdscr, y, 28, desc, attr | curses.A_DIM)
+
+
 def draw_settings_view(stdscr, cfg, cursor, flash_msg=""):
     stdscr.erase()
     h, w = stdscr.getmaxyx()
@@ -61,24 +87,34 @@ def draw_settings_view(stdscr, cfg, cursor, flash_msg=""):
     banner = "  ◈ Stopgate Settings"
     _safe(stdscr, 0, 0, banner.ljust(w)[:w],
           curses.color_pair(_C_HEADER) | curses.A_BOLD)
-    _safe(stdscr, 1, 0, "  Features that can block Claude from ending its turn.", curses.A_DIM)
+    _safe(stdscr, 1, 0, "  Gate blockers + agent-facing output toggles.", curses.A_DIM)
 
     y = 3
+    _safe(stdscr, y, 2, "— Gate blockers —", curses.color_pair(_C_HEADER) | curses.A_BOLD)
+    y += 1
     for idx, (key, label, desc) in enumerate(_FEATURE_LABELS):
-        on = cfg["enabled"].get(key, True)
-        mark = "[X]" if on else "[ ]"
-        color = curses.color_pair(_C_GREEN) if on else curses.color_pair(_C_RED)
-        attr = curses.A_REVERSE if idx == cursor else 0
-        _safe(stdscr, y, 2, mark, color | attr | curses.A_BOLD)
-        _safe(stdscr, y, 6, label, attr | curses.A_BOLD)
-        _safe(stdscr, y, 28, desc, attr | curses.A_DIM)
+        _draw_row(stdscr, y, cfg["enabled"].get(key, True), label, desc, idx == cursor)
         y += 1
 
     y += 1
     loc_idx = len(_FEATURE_LABELS)
     attr = curses.A_REVERSE if cursor == loc_idx else 0
     _safe(stdscr, y, 2, f"Max LOC per file: {cfg['loc_limit']}", attr | curses.A_BOLD)
-    _safe(stdscr, y, 40, "(Enter to edit)", attr | curses.A_DIM)
+    _safe(stdscr, y, 40, "(Enter to edit — hard block)", attr | curses.A_DIM)
+    y += 1
+    notify_idx = loc_idx + 1
+    attr = curses.A_REVERSE if cursor == notify_idx else 0
+    _safe(stdscr, y, 2, f"Notify LOC threshold: {cfg['notify_loc']}", attr | curses.A_BOLD)
+    _safe(stdscr, y, 40, "(Enter to edit — soft [!] warn)", attr | curses.A_DIM)
+    y += 2
+
+    _safe(stdscr, y, 2, "— Agent-facing features —", curses.color_pair(_C_HEADER) | curses.A_BOLD)
+    y += 1
+    claude = cfg.get("claude", {})
+    base = len(_FEATURE_LABELS) + 2
+    for idx, (key, label, desc) in enumerate(_CLAUDE_LABELS):
+        _draw_row(stdscr, y, claude.get(key, True), label, desc, (base + idx) == cursor)
+        y += 1
 
     footer = "  ↑↓ move   Space/Enter toggle   Enter on LOC edits   e/q/Esc close"
     _safe(stdscr, h - 2, 0, footer.ljust(w)[:w], curses.A_DIM)
@@ -91,7 +127,11 @@ def draw_settings_view(stdscr, cfg, cursor, flash_msg=""):
 def run_settings_loop(stdscr):
     cfg = stopgate_config.load()
     cursor = 0
-    total = len(_FEATURE_LABELS) + 1
+    gate_n = len(_FEATURE_LABELS)
+    loc_idx = gate_n
+    notify_idx = gate_n + 1
+    claude_base = gate_n + 2
+    total = claude_base + len(_CLAUDE_LABELS)
     flash = ""
     while True:
         draw_settings_view(stdscr, cfg, cursor, flash)
@@ -106,11 +146,27 @@ def run_settings_loop(stdscr):
         elif key in (curses.KEY_DOWN, ord('j')):
             cursor = (cursor + 1) % total
         elif key in (ord(' '), 10, 13, curses.KEY_ENTER):
-            if cursor < len(_FEATURE_LABELS):
+            if cursor < gate_n:
                 feat = _FEATURE_LABELS[cursor][0]
                 cfg["enabled"][feat] = not cfg["enabled"].get(feat, True)
                 stopgate_config.save(cfg)
                 flash = f"{feat} → {'enabled' if cfg['enabled'][feat] else 'disabled'}"
+            elif cursor >= claude_base:
+                feat = _CLAUDE_LABELS[cursor - claude_base][0]
+                claude = cfg.setdefault("claude", {})
+                claude[feat] = not claude.get(feat, True)
+                stopgate_config.save(cfg)
+                flash = f"claude.{feat} → {'enabled' if claude[feat] else 'disabled'}"
+            elif cursor == notify_idx:
+                val = _prompt_int(stdscr, "Notify LOC", cfg["notify_loc"])
+                if val is None:
+                    flash = ""
+                elif val is False:
+                    flash = "Invalid — enter a positive integer"
+                else:
+                    cfg["notify_loc"] = val
+                    stopgate_config.save(cfg)
+                    flash = f"Notify LOC → {val}"
             else:
                 val = _prompt_int(stdscr, "Max LOC", cfg["loc_limit"])
                 if val is None:

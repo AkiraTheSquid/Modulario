@@ -144,7 +144,7 @@ def draw_ranked_view(stdscr, rows, scroll, target_dir, sort_key, thresholds, fla
     # ── Row h-1: footer ────────────────────────────────────────────────────────
     end_row  = min(scroll + content_h, len(rows))
     pos_info = f" {min(scroll + 1, max(len(rows), 1))}–{end_row}/{len(rows)} "
-    hints    = " ↑↓/jk  PgUp/PgDn  g/G  L=loc  D=deps  S=score  U=churn  b=back  q=quit"
+    hints    = " ↑↓/jk  PgUp/PgDn  g/G  L=loc  D=deps  S=score  b=back  q=quit"
     if flash_msg:
         _safe(stdscr, h - 1, 0, flash_msg.center(w)[:w], curses.A_BOLD)
     else:

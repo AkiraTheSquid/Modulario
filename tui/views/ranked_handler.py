@@ -27,9 +27,6 @@ def handle_ranked_view(stdscr, state, view, snap, dirty, flash_msg, h):
         return None
     if key == 3:
         return 'break'
-    elif key in (ord('u'), ord('U')):
-        view.show_ranked   = False; view.ranked_scroll = 0
-        view.show_churn    = True;  view.churn_scroll  = 0
     elif key in (ord('q'), ord('Q'), 27):
         view.show_ranked   = False
         view.ranked_scroll = 0

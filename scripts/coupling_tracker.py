@@ -24,7 +24,7 @@ def coupling_path(output_path):
 
 # ─── Core computation ─────────────────────────────────────────────────────────
 
-def update_coupling(coup_path, history, churn_data, thresholds):
+def update_coupling(coup_path, history, thresholds):
     """
     Enumerate co-change pairs from *history* within coupling_window sessions.
     Always writes coupling.json (even below min_sessions).
@@ -38,8 +38,11 @@ def update_coupling(coup_path, history, churn_data, thresholds):
     window        = history[-window_size:] if len(history) > window_size else history
     session_count = len(window)
 
-    files_churn  = churn_data.get('files', {}) if churn_data else {}
-    sessions_map = {p: cd.get('sessions_touched', 0) for p, cd in files_churn.items()}
+    # Per-file session counts derived from the history window.
+    sessions_map = {}
+    for record in window:
+        for path in record.get('changed', []):
+            sessions_map[path] = sessions_map.get(path, 0) + 1
 
     # Enumerate all pairs that co-occurred in at least one session
     co_count = {}
