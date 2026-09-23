@@ -1,47 +1,30 @@
-<!-- modulario:template -->
-# projects
+# Project registry
 
 ## Purpose
-- One or two sentences on what this folder is responsible for.
-- Describe the business/domain concern, not the technical details.
 
-## Owns
-- List the main responsibilities this folder **does own**.
-- Each item should be something that changes when this folder changes.
+Defines projects eligible for always-on Modulario hook routing. Global Claude/Codex hooks never use `current-target.txt` to decide whether an agent edit belongs to Modulario; they match edited paths against enabled registry entries.
 
-## Does NOT own
-- List responsibilities that live elsewhere to prevent scope creep.
-- Link to the other folder/module if relevant.
+## Schema
 
-## Key Files
-- `example.js`: short description of what this file is and when it runs.
+Each `<name>.json` supports:
 
-## Data & External Dependencies
-- What data models or types this area works with.
-- What external services or libraries it directly touches.
-- Any important shared modules it depends on.
+- `name`: stable CLI token (`mod delta-note`).
+- `display_name`: project-picker label.
+- `target_dir`: absolute project root.
+- `enabled`: optional; defaults true.
+- `priority`: cold-start picker order before usage history exists.
+- Extra project-specific metadata is preserved and ignored by routing.
 
-## How It Works (Flow)
-1. Brief step-by-step of the main flow.
-2. Optional secondary flows if they are important.
+## Flow
 
-## Invariants & Constraints
-- Rules that **must** remain true.
-- Performance or security constraints.
-- "Never do X" type rules that are easy to forget.
+1. Bare `mod` loads enabled entries, removes missing/duplicate roots, ranks them using `data/project-history.json`, then opens curses picker.
+2. Pre/PostToolUse adapters choose deepest registry root containing changed path or hook `cwd`.
+3. Post hook records provider/session touched files for matched project only.
+4. Stop hook loads only matching provider/session scopes across registered projects.
 
-## Extension Points
-- How to add a new feature in this area.
-- What file to start from when extending behavior.
+## Invariants
 
-## Known Issues, Recurring Bugs, and Pain Points (and How to Prevent Them)
-
-- **Short name of issue** — `ACTIVE` or `RESOLVED`
-  - When it happens: one line about the situation/context.
-  - Symptom: what you see break.
-  - Root cause: the underlying mistake or assumption.
-  - Prevention/fix: the rule, pattern, or helper to use so it doesn't come back.
-  - Status: `ACTIVE` = still a risk, `RESOLVED` = was an issue, now fixed (keep for history).
-
-## Recent Changes
-- 2026-04-14: Initial doc created.
+- Nested projects allowed; deepest matching root wins.
+- Missing directories never appear in picker or hook routing.
+- Runtime usage history belongs under `data/`, never in these checked-in configs.
+- Global hook presence does not imply global scanning; registry match required.

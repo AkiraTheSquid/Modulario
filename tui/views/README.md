@@ -17,6 +17,7 @@ Curses rendering + keyboard-event handling for the Modulario TUI. This is the on
 
 ## Key Files
 - `display.py` — color pair constants, the main-view drawer (`draw_main_view`), watch-view drawer, and `safe_addstr`. Everything in here is stateless drawing.
+- `git_worktree_view.py` — compact center-panel renderer for Git dirtiness and per-feature-scope cleanup progress.
 - `main_handler.py` — main view event loop iteration: matrix + tree + footer, then a keypress dispatch for navigation, threshold edits, clipboard copy, bug report, settings page, reanalyze, folder switch.
 - `ranked_view.py` + `ranked_handler.py` — the sorted-file views (LOC, DEPS, priority). Split for the same draw-vs-handle reason.
 - `watch_handler.py` — watch list view: scroll, enable/disable, run-one, run-all. Uses a background thread for run-all so the UI stays responsive; callbacks close over `state` and mutate under `state.lock`.
@@ -36,6 +37,7 @@ Curses rendering + keyboard-event handling for the Modulario TUI. This is the on
 4. It mutates `view` for scroll/cursor changes and `state.data` (under `state.lock`) for anything shared.
 5. It returns `None` to keep running, `'break'` to exit, or changes `view.mode` to switch to a different handler on the next iteration.
 6. Settings page is the exception: it runs its own inner loop via `run_settings_loop` and returns only when the user exits the page.
+7. Main layout reserves rows between the file tree and triangle matrix for the Git worktree panel.
 
 ## Invariants & Constraints
 - **This is the only folder that may `import curses`.** Adding curses imports to `core/` breaks the separation and makes `core/` untestable outside a terminal.
@@ -71,4 +73,5 @@ Curses rendering + keyboard-event handling for the Modulario TUI. This is the on
   - Status: `RESOLVED`.
 
 ## Recent Changes
+- 2026-07-28: `settings_page.py` gained a "Max agents per session" row beneath the two LOC thresholds, writing `max_agents` in `configs/stopgate.json`. `_prompt_int` grew an `allow_zero` flag because 0 is a real value for this setting ("block every subagent") where it is meaningless for a LOC limit. Row indices shifted: the agent-facing toggle block now starts at `len(_FEATURE_LABELS) + 3`, so any new scalar row must be added to BOTH `draw_settings_view` and `run_settings_loop` or the cursor and the highlighted line drift apart.
 - 2026-04-14: Initial doc filled in.

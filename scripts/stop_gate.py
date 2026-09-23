@@ -1,338 +1,303 @@
 #!/usr/bin/env python3
-"""Modulario Stop hook gate.
-
-Runs `mod watch run` and checks state.json for circular imports whenever
-Claude tries to end its turn. Blocks stop on failures up to MAX_FIX_ATTEMPTS
-times per session, then releases with a final summarize-and-report instruction.
-"""
-import hashlib
+"""Session/touch-scoped Modulario Stop gate for Claude Code + Codex."""
 import json
 import os
 import subprocess
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from counters import count_loc_python, count_loc_js, count_loc_css
-import stopgate_config
+if os.environ.get("MODULARIO_SKIP") == "1":
+    sys.exit(0)
 
-MODULARIO_DIR = Path(__file__).resolve().parent.parent
+SCRIPT_DIR = Path(__file__).resolve().parent
+MODULARIO_DIR = SCRIPT_DIR.parent
+if (MODULARIO_DIR / "data" / "hooks-paused").exists():
+    sys.exit(0)
+STATE_DIR = MODULARIO_DIR / "data" / "state"
+TMP_DIR = MODULARIO_DIR / "tmp"
+WATCH_RUNNER = SCRIPT_DIR / "modulario-watch-runner.py"
+MAX_FIX_ATTEMPTS = 3
+DOC_MARKER = "<!-- modulario:template -->"
 
-_JS_EXTS = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
-_CSS_EXTS = {'.css', '.scss', '.sass', '.less'}
-_PY_EXTS = {'.py'}
+sys.path.insert(0, str(SCRIPT_DIR))
+from counters import count_loc_css, count_loc_js, count_loc_python  # noqa: E402
+from hook_scope import payload_provider, payload_session_id  # noqa: E402
+from project_registry import load_projects  # noqa: E402
+from session_scope import load_target_session  # noqa: E402
+import stopgate_config  # noqa: E402
+
+
+_JS_EXTS = {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}
+_CSS_EXTS = {".css", ".scss", ".sass", ".less"}
 
 
 def live_loc(abs_path):
-    """Recount LOC from disk. Returns None if the file is missing/unreadable
-    or the extension isn't one we know how to count."""
     try:
-        with open(abs_path, 'r', encoding='utf-8', errors='replace') as fh:
-            content = fh.read()
+        content = Path(abs_path).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
-    ext = os.path.splitext(abs_path)[1].lower()
-    if ext in _PY_EXTS:
+    ext = Path(abs_path).suffix.lower()
+    if ext == ".py":
         return count_loc_python(content)
     if ext in _JS_EXTS:
         return count_loc_js(content)
     if ext in _CSS_EXTS:
         return count_loc_css(content)
     return None
-CURRENT_TARGET = MODULARIO_DIR / "configs" / "current-target.txt"
-TMP_DIR = MODULARIO_DIR / "tmp"
-MOD_BIN = MODULARIO_DIR / "bin" / "modulario"
-MAX_FIX_ATTEMPTS = 3
-DOC_MARKER = "<!-- modulario:template -->"
 
 
-def load_payload():
-    try:
-        return json.load(sys.stdin)
-    except Exception:
-        return {}
-
-
-def session_state_path(session_id):
-    safe = "".join(c for c in str(session_id) if c.isalnum() or c in "-_") or "default"
+def session_state_path(provider, session_id):
+    raw = f"{provider}_{session_id}"
+    safe = "".join(char for char in raw if char.isalnum() or char in "-_") or "default"
     return TMP_DIR / f"stop_retries_{safe}.json"
 
 
-def load_state(path):
-    if not path.exists():
-        return {"count": 0, "final_shown": False}
+def load_retry_state(path):
     try:
-        return json.loads(path.read_text())
-    except Exception:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
         return {"count": 0, "final_shown": False}
 
 
-def save_state(path, state):
-    TMP_DIR.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(state))
+def save_retry_state(path, state):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state), encoding="utf-8")
 
 
-def clear_state(path):
+def clear_retry_state(path):
     try:
         path.unlink()
     except FileNotFoundError:
         pass
 
 
-def target_state_file(target):
-    h = hashlib.md5(os.path.realpath(target).encode()).hexdigest()[:12]
-    return MODULARIO_DIR / "data" / "state" / f"{h}.json"
-
-
-STATE_DIR = MODULARIO_DIR / "data" / "state"
-
-
-def iter_tracked_targets(active_target):
-    """Yield (target_dir, touched_folders_list) for state entries whose
-    target_dir is the active target or a subdirectory of it. Skips entries
-    whose sibling state.json is missing or whose target_dir no longer exists."""
-    if not STATE_DIR.exists() or not active_target:
-        return
-    active_real = os.path.realpath(active_target)
-    for touched_path in sorted(STATE_DIR.glob("*_touched.json")):
-        state_path = touched_path.with_name(touched_path.name.replace("_touched.json", ".json"))
-        if not state_path.exists():
-            continue
-        try:
-            state = json.loads(state_path.read_text())
-            target = state.get("target_dir") or ""
-        except Exception:
-            continue
-        if not target or not os.path.isdir(target):
-            continue
-        target_real = os.path.realpath(target)
-        if target_real != active_real and not target_real.startswith(active_real + os.sep):
-            continue
-        try:
-            folders = json.loads(touched_path.read_text()).get("folders", []) or []
-        except Exception:
-            folders = []
-        yield target, folders
-
-
-def unfilled_touched_docs_all(active_target):
-    """Scan the active target, return list of (target, folder) pairs where
-    the touched folder's README.md is missing or still a template."""
-    result = []
-    for target, folders in iter_tracked_targets(active_target):
-        for folder in folders:
-            folder_abs = os.path.join(target, folder)
-            if os.path.exists(os.path.join(folder_abs, ".doc.dismissed")):
-                continue
-            readme = os.path.join(folder_abs, "README.md")
-            if not os.path.exists(readme):
-                result.append((target, folder))
-                continue
-            try:
-                with open(readme, "r", encoding="utf-8") as fh:
-                    if DOC_MARKER in fh.readline():
-                        result.append((target, folder))
-            except OSError:
-                pass
-    return result
-
-
-def oversized_files_all(active_target, loc_limit):
-    """Scan state.json files for the active target (or its subdirs) only."""
-    result = []
-    if not STATE_DIR.exists() or not active_target:
-        return result
-    active_real = os.path.realpath(active_target)
-    for state_path in sorted(STATE_DIR.glob("*.json")):
-        name = state_path.name
-        if name.endswith("_touched.json") or name.endswith("_coupling.json"):
-            continue
-        try:
-            data = json.loads(state_path.read_text())
-        except Exception:
-            continue
-        target = data.get("target_dir") or ""
-        if not target or not os.path.isdir(target):
-            continue
-        target_real = os.path.realpath(target)
-        if target_real != active_real and not target_real.startswith(active_real + os.sep):
-            continue
-        for f in data.get("files", []) or []:
-            cached_loc = f.get("loc", 0)
-            if cached_loc <= loc_limit:
-                continue
-            abs_path = f.get("abs_path") or os.path.join(target, f.get("path", ""))
-            if not os.path.isfile(abs_path):
-                continue
-            current = live_loc(abs_path)
-            if current is None or current <= loc_limit:
-                continue
-            result.append((abs_path, current))
-    result.sort(key=lambda x: -x[1])
-    return result
-
-
-def get_cycles(target):
-    sf = target_state_file(target)
-    if not sf.exists():
-        return []
-    try:
-        data = json.loads(sf.read_text())
-        return data.get("violations", {}).get("cycles", []) or []
-    except Exception:
-        return []
-
-
-def run_watches():
+def _run_watches(target, scope_folders):
     try:
         proc = subprocess.run(
-            [str(MOD_BIN), "watch", "run"],
+            [
+                sys.executable, str(WATCH_RUNNER),
+                "--target", target,
+                "--changed-file", "",
+                "--print-plain",
+                "--scope-folders-json", json.dumps(sorted(scope_folders)),
+            ],
             capture_output=True,
             text=True,
             timeout=180,
+            env={**os.environ, "MODULARIO_SKIP": "1"},
         )
-        return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
-    except Exception as e:
-        return 1, f"watch runner error: {e}"
+        return proc.returncode, ((proc.stdout or "") + (proc.stderr or "")).strip()
+    except Exception as exc:
+        return 1, f"watch runner error: {exc}"
 
 
-def format_cycles(cycles):
-    if not cycles:
-        return ""
-    lines = ["Circular imports detected:"]
-    for c in cycles:
-        files = c.get("files", []) if isinstance(c, dict) else c
-        lines.append("  " + " -> ".join(files))
-    return "\n".join(lines)
+def _scoped_cycles(state, scope_files):
+    cycles = state.get("violations", {}).get("cycles", []) or []
+    result = []
+    for cycle in cycles:
+        files = cycle.get("files", []) if isinstance(cycle, dict) else cycle
+        if set(files or []) & scope_files:
+            result.append(cycle)
+    return result
+
+
+def _scoped_oversized(target_scope, loc_limit):
+    result = []
+    target = target_scope["target"]
+    scope_files = target_scope["scope_files"]
+    for item in target_scope["state"].get("files", []) or []:
+        rel = item.get("path") or ""
+        if rel not in scope_files or (item.get("loc") or 0) <= loc_limit:
+            continue
+        abs_path = item.get("abs_path") or os.path.join(target, rel)
+        current = live_loc(abs_path)
+        if current is not None and current > loc_limit:
+            result.append((abs_path, current))
+    return sorted(result, key=lambda pair: -pair[1])
+
+
+def _unfilled_touched_docs(target_scope):
+    target = target_scope["target"]
+    result = []
+    for folder in target_scope["touched_folders"]:
+        folder_abs = os.path.join(target, folder)
+        if os.path.exists(os.path.join(folder_abs, ".doc.dismissed")):
+            continue
+        readme = os.path.join(folder_abs, "README.md")
+        try:
+            first_line = Path(readme).read_text(encoding="utf-8").splitlines()[0]
+        except (OSError, IndexError):
+            first_line = ""
+        if not first_line or DOC_MARKER in first_line:
+            result.append(readme)
+    return result
+
+
+def _project_failures(target_scope, enabled, loc_limit, scope_filter):
+    if scope_filter:
+        scope_files = target_scope["scope_files"]
+        scope_folders = target_scope["scope_folders"]
+    else:
+        scope_files = {item.get("path") for item in target_scope["state"].get("files", [])}
+        scope_folders = None
+
+    if enabled.get("watches", True):
+        watch_exit, watch_out = _run_watches(
+            target_scope["target"],
+            scope_folders if scope_folders is not None else set(),
+        ) if scope_folders is not None else _run_watches_unscoped(target_scope["target"])
+    else:
+        watch_exit, watch_out = 0, ""
+
+    scoped = dict(target_scope)
+    scoped["scope_files"] = scope_files
+    return {
+        "target": target_scope["target"],
+        "watch_exit": watch_exit,
+        "watch_out": watch_out,
+        "cycles": _scoped_cycles(target_scope["state"], scope_files)
+        if enabled.get("cycles", True) else [],
+        "docs": _unfilled_touched_docs(target_scope)
+        if enabled.get("unfilled_docs", True) else [],
+        "oversized": _scoped_oversized(scoped, loc_limit)
+        if enabled.get("oversized_files", True) else [],
+    }
+
+
+def _run_watches_unscoped(target):
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(WATCH_RUNNER), "--target", target, "--print-plain"],
+            capture_output=True,
+            text=True,
+            timeout=180,
+            env={**os.environ, "MODULARIO_SKIP": "1"},
+        )
+        return proc.returncode, ((proc.stdout or "") + (proc.stderr or "")).strip()
+    except Exception as exc:
+        return 1, f"watch runner error: {exc}"
+
+
+def _format_failures(failures, loc_limit):
+    parts = []
+    multi = len(failures) > 1
+    for failure in failures:
+        project_parts = []
+        if failure["watch_exit"]:
+            project_parts.append("[Modulario] scoped watch FAILED:\n" + failure["watch_out"])
+        if failure["cycles"]:
+            lines = ["[Modulario] Circular imports intersecting touched graph scope:"]
+            for cycle in failure["cycles"]:
+                files = cycle.get("files", []) if isinstance(cycle, dict) else cycle
+                lines.append("  " + " -> ".join(files))
+            project_parts.append("\n".join(lines))
+        if failure["docs"]:
+            lines = ["[Modulario] Touched folders with unfilled README.md:"]
+            lines.extend(f"  {path}" for path in failure["docs"])
+            lines.append("\nFill docs with intent, rationale, invariants, constraints, integration, gotchas. Remove template marker from line 1.")
+            project_parts.append("\n".join(lines))
+        if failure["oversized"]:
+            lines = [f"[Modulario] Files exceeding {loc_limit} LOC inside touched graph scope:"]
+            lines.extend(f"  {path}  ({loc} LOC)" for path, loc in failure["oversized"])
+            lines.append(f"\nSplit listed files below {loc_limit} LOC. Keep public API stable. Use `mod graph <file> --target {failure['target']}` before moving code.")
+            project_parts.append("\n".join(lines))
+        if project_parts:
+            prefix = f"Project: {failure['target']}\n" if multi else ""
+            parts.append(prefix + "\n\n".join(project_parts))
+    return "\n\n".join(parts)
+
+
+def _fix_line(failures, loc_limit):
+    tasks = []
+    if any(f["watch_exit"] for f in failures):
+        tasks.append("fix scoped failing watch(es)")
+    if any(f["cycles"] for f in failures):
+        tasks.append("break scoped circular import(s)")
+    if any(f["docs"] for f in failures):
+        tasks.append("fill touched-folder README.md files")
+    if any(f["oversized"] for f in failures):
+        tasks.append(f"split scoped files over {loc_limit} LOC")
+    return "; ".join(tasks) or "resolve scoped issues"
 
 
 def block(reason):
     print(json.dumps({"decision": "block", "reason": reason}))
-    sys.exit(0)
-
-
-def allow():
-    sys.exit(0)
 
 
 def main():
-    payload = load_payload()
-    session_id = payload.get("session_id", "default")
-
-    sp = session_state_path(session_id)
-    state = load_state(sp)
-
-    if state.get("final_shown"):
-        allow()
-
-    # Watches + cycles still read from the active target (that's what
-    # `mod watch run` scopes to anyway). Doc checks scan every tracked target.
-    active_target = ""
-    if CURRENT_TARGET.exists():
-        candidate = CURRENT_TARGET.read_text().strip()
-        if candidate and os.path.isdir(candidate):
-            active_target = candidate
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:
+        payload = {}
+    provider = payload_provider(payload)
+    session_id = payload_session_id(payload)
+    retry_path = session_state_path(provider, session_id)
+    retry_state = load_retry_state(retry_path)
+    if retry_state.get("final_shown"):
+        return
 
     cfg = stopgate_config.load()
-    enabled = cfg["enabled"]
     claude_cfg = cfg.get("claude", {})
-    loc_limit = cfg["loc_limit"]
-
     if not claude_cfg.get("gate_master", True):
-        allow()
+        return
 
-    if enabled.get("watches", True):
-        watch_exit, watch_out = run_watches()
-    else:
-        watch_exit, watch_out = 0, ""
-    cycles = get_cycles(active_target) if (active_target and enabled.get("cycles", True)) else []
-    unfilled_docs = unfilled_touched_docs_all(active_target) if enabled.get("unfilled_docs", True) else []
-    oversized = oversized_files_all(active_target, loc_limit) if enabled.get("oversized_files", True) else []
-    failing = watch_exit != 0 or bool(cycles) or bool(unfilled_docs) or bool(oversized)
-
-    if not failing:
-        clear_state(sp)
-        allow()
-
-    state["count"] = int(state.get("count", 0)) + 1
-
-    parts = []
-    if watch_exit != 0:
-        parts.append("[Modulario] `mod watch run` FAILED:\n" + watch_out.strip())
-    if cycles:
-        parts.append("[Modulario] " + format_cycles(cycles))
-    if unfilled_docs:
-        doc_lines = ["[Modulario] Touched folders with unfilled README.md:"]
-        for target_dir, folder in unfilled_docs:
-            doc_lines.append(f"  {os.path.join(target_dir, folder, 'README.md')}")
-        doc_lines.append(
-            "\nFill these in with information a reader would NOT be able to glean "
-            "from reading the code itself — intent, rationale, invariants, non-obvious "
-            "constraints, how this folder fits into the larger system, gotchas. "
-            "Do NOT just restate what the code does. Remove the template marker "
-            "(`<!-- modulario:template -->`) from line 1 when done."
+    target_scopes = []
+    for project in load_projects():
+        scope = load_target_session(
+            STATE_DIR, project["target_dir"], session_id, provider
         )
-        parts.append("\n".join(doc_lines))
-    if oversized:
-        loc_lines = [f"[Modulario] Files exceeding {loc_limit} LOC:"]
-        for path, loc in oversized:
-            loc_lines.append(f"  {path}  ({loc} LOC)")
-        loc_lines.append(
-            f"\nSplit these files so each is under {loc_limit} LOC. Extract cohesive "
-            "chunks into sibling modules; keep public API stable. Use `mod graph <file>` "
-            "to see importers before moving code."
-        )
-        parts.append("\n".join(loc_lines))
-    detail = "\n\n".join(parts) or "Modulario detected a problem."
+        if scope:
+            target_scopes.append(scope)
+    if not target_scopes:
+        clear_retry_state(retry_path)
+        return
 
-    if state["count"] <= MAX_FIX_ATTEMPTS:
-        save_state(sp, state)
-        fix_instructions = []
-        if watch_exit != 0:
-            fix_instructions.append("fix the failing watch(es)")
-        if cycles:
-            fix_instructions.append("break the circular import(s)")
-        if unfilled_docs:
-            fix_instructions.append("fill in the README.md for each touched folder listed above")
-        if oversized:
-            fix_instructions.append(f"split files over {loc_limit} LOC listed above")
-        fix_line = "; ".join(fix_instructions) if fix_instructions else "resolve the issues above"
-        escape_line = ""
+    failures = [
+        _project_failures(
+            scope,
+            cfg["enabled"],
+            cfg["loc_limit"],
+            claude_cfg.get("scope_filter", True),
+        )
+        for scope in target_scopes
+    ]
+    failures = [
+        failure for failure in failures
+        if failure["watch_exit"] or failure["cycles"] or failure["docs"] or failure["oversized"]
+    ]
+    if not failures:
+        clear_retry_state(retry_path)
+        return
+
+    retry_state["count"] = int(retry_state.get("count", 0)) + 1
+    detail = _format_failures(failures, cfg["loc_limit"])
+    if retry_state["count"] <= MAX_FIX_ATTEMPTS:
+        save_retry_state(retry_path, retry_state)
+        escape = ""
         if claude_cfg.get("escape_hatch", True):
-            escape_line = (
-                "\n\nEscape hatch: if the failures above are OUTSIDE the scope of what "
-                "the user asked you to do (e.g. a pre-existing broken watch, an unfilled "
-                "README for a folder the user never touched, an oversized file you never "
-                "edited), do NOT spend retries fixing unrelated work. Instead:\n"
-                "  1. In your final message, explain WHY the failures are out of scope and "
-                "what you would have had to change to fix them.\n"
-                "  2. Then run:  mod end-attempt \"<one-sentence reason>\"\n"
-                "  3. Then end your turn normally. The next Stop will allow immediately.\n"
-                "Only use the escape hatch when the failures genuinely don't belong to your "
-                "current task — not to skip fixing real bugs you introduced."
+            escape = (
+                "\n\nEscape hatch: only for genuinely out-of-scope failures. Explain why, "
+                "run `mod end-attempt \"<one-sentence reason>\"`, then end turn."
             )
-        reason = (
-            f"Stop blocked by Modulario (fix attempt {state['count']}/{MAX_FIX_ATTEMPTS}).\n\n"
-            f"{detail}\n\n"
-            f"Next: {fix_line}, then try to stop again.{escape_line}"
+        block(
+            f"Stop blocked by Modulario (fix attempt {retry_state['count']}/{MAX_FIX_ATTEMPTS}).\n\n"
+            f"{detail}\n\nNext: {_fix_line(failures, cfg['loc_limit'])}, then try to stop again.{escape}"
         )
-        block(reason)
-    else:
-        state["final_shown"] = True
-        save_state(sp, state)
-        reason = (
-            f"Modulario: {MAX_FIX_ATTEMPTS} fix attempts exhausted. STOP TRYING TO FIX.\n\n"
-            "Do all of the following, then end your turn:\n"
-            "  1. Summarize what you did this session as usual.\n"
-            "  2. Tell the user which Modulario checks are still failing.\n"
-            "  3. Paste the failing output verbatim:\n\n"
-            f"{detail}\n\n"
-            "  4. For any watch / cycle failures, give your judgment: real bug vs. false positive, with reasoning.\n"
-            "  5. For any unfilled docs, say why you couldn't complete them.\n\n"
-            "After this turn, further stop attempts in this session will be allowed automatically."
-        )
-        block(reason)
+        return
+
+
+    retry_state["final_shown"] = True
+    save_retry_state(retry_path, retry_state)
+    block(
+        f"Modulario: {MAX_FIX_ATTEMPTS} scoped fix attempts exhausted. Stop fixing.\n\n"
+        "Summarize work; report remaining scoped failures; judge real bug vs false positive.\n\n"
+        f"{detail}"
+    )
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        if os.environ.get("MODULARIO_DEBUG") == "1":
+            print(f"[Modulario] stop-hook error: {exc}", file=sys.stderr)

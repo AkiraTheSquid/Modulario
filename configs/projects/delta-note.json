@@ -1,6 +1,13 @@
 {
   "name": "delta-note",
-  "target_dir": "/home/stellar-thread/Applications/Delta-Note-Local",
-  "hook_settings_file": "/home/stellar-thread/Applications/Delta-Note-Local/.claude/settings.json",
-  "created": "2026-03-25T12:35:45.488558"
+  "display_name": "Delta Note",
+  "target_dir": "/home/stellar-thread/Applications/Delta-Note",
+  "enabled": true,
+  "priority": 30,
+  "hook_settings_file": "/home/stellar-thread/Applications/Delta-Note/.claude/settings.json",
+  "created": "2026-03-25T12:35:45.488558",
+  "mcp_devtools": {
+    "enabled": true,
+    "remote_debug_port": 9222
+  }
 }

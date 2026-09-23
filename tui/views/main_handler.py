@@ -17,6 +17,7 @@ from core.utils import build_text_dump, copy_to_clipboard
 from views.display import (CHROME_ROWS, FOOTER_ROWS, MATRIX_ROWS, draw_main_view,
                            violation_rows)
 from views.input_prompt import prompt_input
+from views.git_worktree_view import worktree_panel_height
 from views.settings_page import run_settings_loop
 
 
@@ -26,7 +27,13 @@ def handle_main_view(stdscr, state, view, snap, dirty, flash_msg, h):
 
     matrix_rows = MATRIX_ROWS if view.show_matrix else 0
     viol_rows   = violation_rows(snap.violations, snap.watch_results)
-    content_h   = max(0, h - CHROME_ROWS - matrix_rows - viol_rows - FOOTER_ROWS)
+    git_capacity = max(
+        0, h - CHROME_ROWS - matrix_rows - viol_rows - FOOTER_ROWS - 1
+    )
+    git_rows    = worktree_panel_height(
+        snap.git_worktree, snap.git_checkpoint, h, max_rows=git_capacity
+    )
+    content_h   = max(0, h - CHROME_ROWS - git_rows - matrix_rows - viol_rows - FOOTER_ROWS)
     max_scroll  = max(0, len(snap.rows) - content_h)
     view.scroll = max(0, min(view.scroll, max_scroll))
 
@@ -35,7 +42,8 @@ def handle_main_view(stdscr, state, view, snap, dirty, flash_msg, h):
                        snap.target_dir, snap.thresholds, snap.cell_counts, flash_msg,
                        view.show_matrix, snap.violations, snap.folder_metrics,
                        activity=snap.activity, activity_folders=snap.activity_folders,
-                       fan_in_map=snap.fan_in_map, watch_results=snap.watch_results)
+                       fan_in_map=snap.fan_in_map, watch_results=snap.watch_results,
+                       git_worktree=snap.git_worktree, git_checkpoint=snap.git_checkpoint)
 
     key = stdscr.getch()
     if key == -1:
@@ -59,6 +67,7 @@ def handle_main_view(stdscr, state, view, snap, dirty, flash_msg, h):
             data['activity_folders'] = build_activity_folder_metrics(activity)
             data['flash'] = (f"Checkpoint saved at {stamp}", time.time())
             data['dirty'] = True
+        state.checkpoint_git(label=stamp)
         return None
     elif key in (curses.KEY_UP, ord('k')):
         view.scroll = max(0, view.scroll - 1)

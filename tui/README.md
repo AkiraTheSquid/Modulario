@@ -1,7 +1,7 @@
 # tui
 
 ## Purpose
-The interactive terminal UI for Modulario — a live dashboard that shows a project's structural health (LOC/DEPS bands, folder rollups, import violations, watch results) and lets the user reanalyze, edit thresholds, switch targets, and manage folder-level watch scripts without leaving the terminal. It's the human-facing front end for the data produced by `scripts/modulario-analyze.py`.
+The interactive terminal UI for Modulario — a live dashboard that shows a project's structural health (LOC/DEPS bands, folder rollups, import violations, watch results), plus Git worktree cleanup progress grouped by top-level feature scope. It lets the user reanalyze, checkpoint progress, edit thresholds, switch targets, and manage folder-level watch scripts without leaving the terminal. It's the human-facing front end for the data produced by `scripts/modulario-analyze.py`.
 
 ## Owns
 - `modulario-tui.py` — the entry point and outer curses loop. Owns the `wrapper()` call, the per-view dispatch, the `dirty` flag lifecycle, and the flash-message timer.
@@ -18,6 +18,7 @@ The interactive terminal UI for Modulario — a live dashboard that shows a proj
 - `modulario-tui.py` — curses entry point. Initializes colors, builds the initial `TuiState`, then runs the outer loop: read snapshot under lock → call the current view's handler → check return value → repeat.
 - `core/` — non-UI backbone. Shared state, state.json I/O, analyzer invocation, derived metrics, watch execution, bug report formatting. Zero curses. See `core/README.md`.
 - `views/` — curses drawing and input handlers, one pair per view. The only folder allowed to `import curses`. See `views/README.md`.
+- `core/git_worktree.py` + `views/git_worktree_view.py` — live Git porcelain snapshot, cleanup checkpoint math, and aligned center-table rendering with staged/modified/new/conflict plus critic quick-fix/major-refactor counts. `S` resets both structural and Git baselines.
 - `watch.py` — this folder's own health check; asserts the core/views split.
 
 ## Data & External Dependencies
@@ -27,6 +28,7 @@ The interactive terminal UI for Modulario — a live dashboard that shows a proj
 - **configs/stopgate.json** — stop-hook feature toggles. Edited from the settings page; the stop hook reads the same file out-of-process.
 - **watchdog** (optional) — live state.json reloads. Code tolerates its absence.
 - **curses** — Python stdlib. No ncurses extensions used, so it runs on any POSIX terminal.
+- **Git** — adaptively polled every 1.5–5 seconds for branch, staged/unstaged/untracked/conflict counts, and top-level scope progress. Non-repositories degrade to an unavailable row.
 
 ## How It Works (Flow)
 1. `modulario-tui.py` reads `configs/current-target.txt`, builds a `TuiState`, and enters `curses.wrapper(main)`.
@@ -35,6 +37,7 @@ The interactive terminal UI for Modulario — a live dashboard that shows a proj
 4. View switches happen by mutating `view.mode`; the next iteration dispatches to the new handler.
 5. Long-running work (analyzer runs, run-all watches) is spawned on background threads that update shared state under the lock; the outer loop redraws on the next tick.
 6. Settings page is a blocking sub-loop that returns control only when the user exits.
+7. A background Git poller refreshes the center worktree panel; `S` records a new cleanup baseline without staging or changing files.
 
 ## Invariants & Constraints
 - **`core/` must not import `curses`.** The single most important architectural rule in the TUI. Violating it makes core untestable headlessly.
@@ -65,3 +68,4 @@ The interactive terminal UI for Modulario — a live dashboard that shows a proj
 
 ## Recent Changes
 - 2026-04-14: Initial doc filled in.
+- 2026-07-18: Added center Git worktree cleanup panel with per-scope checkpoint progress.

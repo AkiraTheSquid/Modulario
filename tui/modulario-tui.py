@@ -43,6 +43,7 @@ _SNAP_KEYS = (
     'rows', 'summary', 'last_updated', 'target_dir', 'thresholds',
     'cell_counts', 'violations', 'folder_metrics', 'history',
     'activity', 'activity_folders', 'fan_in_map', 'watch_results',
+    'git_worktree', 'git_checkpoint',
 )
 
 
@@ -86,10 +87,16 @@ def run_tui(stdscr, state_path_str):
         state.data['dirty'] = True
 
     state.start_watcher()
+    last_size = stdscr.getmaxyx()
 
     try:
         while True:
-            h, _w = stdscr.getmaxyx()
+            h, w = stdscr.getmaxyx()
+            if (h, w) != last_size:
+                last_size = (h, w)
+                stdscr.clear()
+                with state.lock:
+                    state.data['dirty'] = True
             snap, dirty, flash = _snapshot(state)
             flash_msg, force_dirty = _compute_flash(state, flash)
             if force_dirty:

@@ -22,6 +22,8 @@ Non-UI backbone for the Modulario TUI: owns the shared mutable state, reads/writ
 - `state_io.py` — state.json path hashing (`state_path_for`), `load_state`, `load_history`, and `analyze_target` which shells out to `modulario-analyze.py`.
 - `tree.py` — folder metrics aggregation + scrollable row flattening honoring the user's collapse set.
 - `activity.py` — baseline-vs-current diffing for the "activity" overlay (added/removed LOC per file/folder).
+- `git_worktree.py` — porcelain parser, dirtiness tiers, feature-scope grouping, and baseline progress. Read-only: never stages or mutates Git state.
+- `../../critic_store.py` — shared Claude/Codex critic note schema and per-target persistence; worktree polling loads its aggregated quick/major counts.
 - `watches.py` — `scan_watches`, `run_watches`, enable/disable/dismiss marker files, and the unfilled-template detection.
 - `bug_report.py` — plaintext formatter for cycles, private-API violations, and failing watches.
 - `utils.py` — `StateWatcher` (watchdog wrapper) and clipboard export helpers.
@@ -33,6 +35,7 @@ Non-UI backbone for the Modulario TUI: owns the shared mutable state, reads/writ
 - **watch.py scripts** — discovered by walking the target directory; run as subprocesses.
 - **watchdog** (optional) — used by `StateWatcher` for live reloads. Code must tolerate import failure since watchdog isn't guaranteed to be installed.
 - **clipboard** — `xclip` / `wl-copy` / `pbcopy` shelled out to from `utils.py`.
+- **Git** — `git_worktree.py` runs bounded read-only subprocesses; non-repositories and timeouts return an unavailable snapshot.
 
 ## How It Works (Flow)
 1. Entry point builds a `TuiState`, which loads the state file for the current target and starts a `StateWatcher`.

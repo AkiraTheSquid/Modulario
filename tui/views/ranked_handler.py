@@ -22,8 +22,6 @@ def handle_ranked_view(stdscr, state, view, snap, dirty, flash_msg, h):
 
     key = stdscr.getch()
     if key == -1:
-        with state.lock:
-            state.data['dirty'] = True
         return None
     if key == 3:
         return 'break'

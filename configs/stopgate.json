@@ -17,8 +17,11 @@
     "watch_nag": true,
     "auto_create_readme": true,
     "auto_create_watch": true,
-    "escape_hatch": true
+    "escape_hatch": true,
+    "quiet_when_clean": true,
+    "scope_filter": true
   },
   "loc_limit": 700,
-  "notify_loc": 650
+  "notify_loc": 650,
+  "max_agents": 3
 }

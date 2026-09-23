@@ -22,6 +22,7 @@ from types import SimpleNamespace
 from core.activity import (activity_from_diff, build_activity_folder_metrics,
                            empty_activity, snapshot_files)
 from core.config import ANALYZER_PATH, THRESHOLDS_PATH
+from core.git_worktree import collect_worktree, empty_worktree, make_checkpoint
 from core.state_io import (analyze_target, load_history, load_state,
                            state_path_for)
 from core.tree import all_dir_paths, build_folder_metrics, flatten_tree
@@ -37,6 +38,7 @@ def _fresh_data():
         'violations': {}, 'history': [],
         'import_graph': {}, 'fan_in_map': {}, 'folder_metrics': {},
         'activity': empty_activity(), 'activity_folders': {},
+        'git_worktree': empty_worktree(), 'git_checkpoint': None,
         'watch_entries': [], 'watch_results': [],
         'checkpoint_files': None, 'checkpoint_label': None,
         'dirty': True, 'flash': None, 'collapsed': set(),
@@ -76,14 +78,65 @@ class TuiState:
         self.lock = threading.Lock()
         self.data = _fresh_data()
         self.state_watcher = None
+        self.git_watcher = None
+        self._git_stop = threading.Event()
 
     def start_watcher(self):
         self.state_watcher = StateWatcher(self.current_state_path, self.reload)
         self.state_watcher.start()
+        self._git_stop.clear()
+        self.git_watcher = threading.Thread(target=self._watch_git, daemon=True)
+        self.git_watcher.start()
 
     def stop_watcher(self):
         if self.state_watcher:
             self.state_watcher.stop()
+        self._git_stop.set()
+        if self.git_watcher:
+            self.git_watcher.join(timeout=1.0)
+
+    def _watch_git(self):
+        delay = 0
+        while not self._git_stop.wait(delay):
+            available, total = self.refresh_git()
+            if not available:
+                delay = 5.0
+            elif total > 200:
+                delay = 3.0
+            else:
+                delay = 1.5
+
+    def refresh_git(self, reset_checkpoint=False):
+        with self.lock:
+            target = self.data.get('target_dir', '')
+        worktree = collect_worktree(target)
+        with self.lock:
+            if target != self.data.get('target_dir', ''):
+                return False, 0
+            previous = self.data.get('git_worktree')
+            checkpoint = self.data.get('git_checkpoint')
+            self.data['git_worktree'] = worktree
+            if worktree != previous:
+                self.data['dirty'] = True
+            if not worktree.get('available'):
+                return False, 0
+            repo_changed = (
+                checkpoint
+                and checkpoint.get('repo_root') != worktree.get('repo_root')
+            )
+            if reset_checkpoint or checkpoint is None or repo_changed:
+                self.data['git_checkpoint'] = make_checkpoint(worktree)
+            return True, worktree.get('total', 0)
+
+    def checkpoint_git(self, label=None):
+        with self.lock:
+            if not self.data.get('git_worktree', {}).get('available'):
+                return False
+            self.data['git_checkpoint'] = make_checkpoint(
+                self.data.get('git_worktree'), label=label
+            )
+            self.data['dirty'] = True
+            return True
 
     def rebuild_rows_locked(self):
         collapsed = set(self.data['collapsed'])
@@ -177,6 +230,7 @@ class TuiState:
             self.state_watcher.update_path(self.current_state_path)
         with self.lock:
             self.data['collapsed'] = all_dir_paths(self.data['files'])
+            self.data['git_checkpoint'] = None
         self.reload()
         with self.lock:
             self.data['collapsed'] = all_dir_paths(self.data['files'])

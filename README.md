@@ -18,10 +18,14 @@ Modulario is the missing feedback loop. Every time a file is written, it scores 
 ## What it gives you
 
 - **Real-time structural feedback** after every file edit, surfaced directly to Claude Code / Codex via PostToolUse hooks
+- **Always-on, project-aware routing** — global hooks stay installed, but edits outside enabled `configs/projects/*.json` roots exit silently
+- **Usage-ranked project picker** — run bare `mod`, choose Delta Note / Delta Drills / Obsidian Trellis, then enter existing live TUI
+- **Agent/session touch scope** — stop checks enforce only direct edits plus one-hop import fan-in/fan-out, preventing unrelated legacy debt from blocking turns
 - **A live TUI** showing every file's status, the worst hotspots, and folder-level health
 - **Auto-generated `README.md` and `watch.py`** templates in every folder, with persistent nags until they're filled in — so documentation and folder-level health checks actually get written
-- **In-the-loop watch.py feedback for Claude Code** — once you fill in a folder's `watch.py`, it runs *between Claude Code's tool calls* via the PostToolUse hook, so a broken import or violated invariant is surfaced to Claude *before its next edit*, not after the session ends. This is the killer feature, and it's why **Claude Code is the recommended frontend** — Codex's hook model doesn't feed results back into the assistant's context the same way, so the live feedback loop is much weaker there
+- **In-the-loop watch.py feedback** — filled watches run after relevant Claude Code/Codex edits; failures return through PostToolUse before the next agent action
 - **Boundary violation detection** — circular imports and private-API leaks across module boundaries
+- **Path-level ignore management** — `mod ignore add/remove/list` updates Modulario's scan exclusions and mirrors them into the target repo's `.gitignore`
 - **Import graph queries** (`mod graph <file>`) — fan-in and fan-out before you rename or split anything
 - **Folder watch scripts** — per-folder health checks that run on every edit and fail loudly when an invariant breaks
 
@@ -33,7 +37,14 @@ You can't ask an AI to "write maintainable code." You have to *show* it, every s
 
 Personal tool, actively used. Linux-first (uses `xclip`/`xsel` for clipboard, curses for the TUI). Python 3, no heavy dependencies.
 
-## What's new — 2026-04-14
+## Recent changes
+
+### 2026-07-18
+
+- Replaced single global target routing with enabled-project registry matching.
+- Added provider/session touched-file state and fan-in/fan-out scoped stop checks.
+- Added Git pre/post snapshots for Bash edits, including already-dirty files.
+- Added bare `mod` project picker ranked by local usage history.
 
 - **Stop-hook gate** — Claude Code can no longer end a turn while `mod watch run` is failing, cycles are detected, touched folders have unfilled `README.md`, or any file is over the LOC limit. Three fix attempts, then it releases with a forced summary.
 - **Settings page** (`e` in the TUI) — toggle each stopgate check and edit the LOC limit live. Writes to `configs/stopgate.json`, shared with the hook.

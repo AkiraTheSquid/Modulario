@@ -1,18 +1,52 @@
 """Watch loading and execution for the TUI — folder-based watch.py system."""
+import json
 import os
 import subprocess
 import sys
 
+from core.config import THRESHOLDS_PATH
+
 WATCH_MARKER = '# modulario:template'
 SKIP_DIRS = {'.git', 'node_modules', '__pycache__', '.next', 'dist', 'build', 'venv', '.venv'}
+
+
+def _normalize_rel_path(path):
+    rel = str(path or '').replace('\\', '/').strip('/')
+    return '' if rel in ('', '.') else rel
+
+
+def _load_skip_dirs():
+    if THRESHOLDS_PATH.exists():
+        try:
+            with open(THRESHOLDS_PATH) as f:
+                data = json.load(f)
+            return [_normalize_rel_path(v) for v in (data.get('skip_dirs') or []) if str(v).strip()]
+        except Exception:
+            pass
+    return []
+
+
+def _filter_walk_dirs(root, dirs, target_dir, skip_entries):
+    target = os.path.realpath(target_dir)
+    root = os.path.realpath(root)
+    rel_root = _normalize_rel_path(os.path.relpath(root, target))
+    kept = []
+    skip = set(skip_entries or [])
+    for dirname in dirs:
+        child_rel = dirname if not rel_root else f"{rel_root}/{dirname}"
+        if dirname in SKIP_DIRS or dirname.startswith('.') or dirname in skip or child_rel in skip:
+            continue
+        kept.append(dirname)
+    return sorted(kept)
 
 
 def scan_watches(target_dir):
     """Walk target_dir and return a list of watch entries for every folder with a watch.py."""
     entries = []
     target = os.path.realpath(target_dir)
+    skip_dirs = _load_skip_dirs()
     for root, dirs, files in os.walk(target):
-        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        dirs[:] = _filter_walk_dirs(root, dirs, target, skip_dirs)
         if 'watch.py' not in files:
             continue
         rel = os.path.relpath(root, target)

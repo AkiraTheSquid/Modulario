@@ -1,5 +1,7 @@
 import curses
 
+from views.git_worktree_view import draw_worktree_panel, worktree_panel_height
+
 MATRIX_ROWS = 6
 CHROME_ROWS = 2
 FOOTER_ROWS = 2
@@ -107,13 +109,15 @@ def _fan_attr(n):
 def draw_main_view(stdscr, rows, scroll_offset, summary, last_updated, target_dir, thresholds,
                    cell_counts, flash_msg='', show_matrix=True, violations=None,
                    folder_metrics=None, activity=None, activity_folders=None,
-                   fan_in_map=None, watch_results=None):
+                   fan_in_map=None, watch_results=None, git_worktree=None,
+                   git_checkpoint=None):
     fan_in_map = fan_in_map or {}
     violations = violations or {}
     watch_results = watch_results or []
     folder_metrics = folder_metrics or {}
     activity = activity or {'files': {}}
     activity_folders = activity_folders or {}
+    git_worktree = git_worktree or {}
     stdscr.erase()
     h, w = stdscr.getmaxyx()
     ts = last_updated[:19].replace('T', ' ') if last_updated else '—'
@@ -144,7 +148,13 @@ def draw_main_view(stdscr, rows, scroll_offset, summary, last_updated, target_di
 
     matrix_rows = MATRIX_ROWS if show_matrix else 0
     viol_rows   = violation_rows(violations, watch_results)
-    content_h   = max(0, h - CHROME_ROWS - matrix_rows - viol_rows - FOOTER_ROWS)
+    git_capacity = max(
+        0, h - CHROME_ROWS - matrix_rows - viol_rows - FOOTER_ROWS - 1
+    )
+    git_rows    = worktree_panel_height(
+        git_worktree, git_checkpoint, h, max_rows=git_capacity
+    )
+    content_h   = max(0, h - CHROME_ROWS - git_rows - matrix_rows - viol_rows - FOOTER_ROWS)
     visible     = rows[scroll_offset: scroll_offset + content_h]
 
     for i, row in enumerate(visible):
@@ -195,19 +205,23 @@ def draw_main_view(stdscr, rows, scroll_offset, summary, last_updated, target_di
             safe_addstr(stdscr, y, watch_x,     f"{'—':>6}", curses.A_DIM)
             safe_addstr(stdscr, y, status_x,    f"  {FILE_DOT[status]} {STATUS_LETTER[status]}", color | extra)
 
+    git_y = CHROME_ROWS + content_h
+    draw_worktree_panel(stdscr, git_y, git_worktree, git_checkpoint, git_rows)
+    matrix_y = git_y + git_rows
+
     if show_matrix:
         loc_bands = thresholds.get('loc_bands', [150, 300, 450, 600, 750])
         dep_bands = thresholds.get('deps_bands', [4, 8, 12, 16, 20])
         N, cell_w, rlabel_w = 5, 8, 9
 
-        safe_addstr(stdscr, CHROME_ROWS + content_h, 0, ' ' * rlabel_w, curses.A_DIM)
+        safe_addstr(stdscr, matrix_y, 0, ' ' * rlabel_w, curses.A_DIM)
         for ci in range(N):
             lbl      = f"DEPS≤{dep_bands[ci]}" if ci < len(dep_bands) else ''
             col_attr = curses.color_pair(FILE_CPAIR[DIAG_STATUS[ci]])
-            safe_addstr(stdscr, CHROME_ROWS + content_h, rlabel_w + ci * cell_w, f"{lbl:^{cell_w}}", col_attr)
+            safe_addstr(stdscr, matrix_y, rlabel_w + ci * cell_w, f"{lbl:^{cell_w}}", col_attr)
 
         for ri in range(N):
-            y        = CHROME_ROWS + content_h + 1 + ri
+            y        = matrix_y + 1 + ri
             lbl      = f"LOC≤{loc_bands[ri]}" if ri < len(loc_bands) else ''
             row_attr = curses.color_pair(FILE_CPAIR[DIAG_STATUS[ri]])
             safe_addstr(stdscr, y, 0, f"{lbl:<{rlabel_w}}", row_attr)
@@ -220,7 +234,7 @@ def draw_main_view(stdscr, rows, scroll_offset, summary, last_updated, target_di
                             curses.color_pair(FILE_CPAIR.get(status, 0)) | curses.A_BOLD)
 
     if viol_rows > 0:
-        viol_y    = CHROME_ROWS + content_h + matrix_rows
+        viol_y    = matrix_y + matrix_rows
         all_items = []
         for c in violations.get('cycles', []):
             chain = ' → '.join(c['files'])
@@ -248,7 +262,7 @@ def draw_main_view(stdscr, rows, scroll_offset, summary, last_updated, target_di
 
     end_row  = min(scroll_offset + content_h, len(rows))
     pos_info = f" {scroll_offset + 1}–{end_row}/{len(rows)} "
-    hints    = " ↑↓/jk  PgUp/PgDn  g/G  r/R refresh  m matrix  w watch  l loc  d dep  L/D/S ranked  t expand  a collapse  c copy  b bugs  q quit"
+    hints    = " ↑↓/jk  PgUp/PgDn  g/G  r/R refresh  m matrix  w watch  l loc  d dep  L/D/s ranked  S checkpoint  t expand  a collapse  c copy  b bugs  q quit"
     if flash_msg:
         safe_addstr(stdscr, h - 1, 0, flash_msg.center(w)[:w], curses.A_BOLD)
     else:

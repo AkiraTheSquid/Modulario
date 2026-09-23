@@ -25,6 +25,8 @@ CLAUDE_FEATURES = (
     "auto_create_readme", # auto-create README.md template in every folder
     "auto_create_watch",  # auto-create watch.py template in every folder
     "escape_hatch",       # allow Claude to bypass retries via `mod end-attempt`
+    "quiet_when_clean",   # suppress entire summary when changed file is GREEN/LIME and no alerts
+    "scope_filter",       # gate nags/watches/hotspots to touched files + fan-in/fan-out
 )
 
 DEFAULTS = {
@@ -32,6 +34,12 @@ DEFAULTS = {
     "claude": {f: True for f in CLAUDE_FEATURES},
     "loc_limit": 700,
     "notify_loc": 650,
+    # How many subagents the PreToolUse guard will let a single session spawn.
+    # 0 keeps the standing "never spawn subagents" rule; raise it deliberately
+    # when a job is genuinely worth fanning out. It is a BUDGET, not a switch:
+    # the guard counts each Agent/Task/Workflow call against it and blocks once
+    # the session has used them up, so a runaway fan-out stops on its own.
+    "max_agents": 0,
 }
 
 
@@ -41,6 +49,7 @@ def load():
         "claude": dict(DEFAULTS["claude"]),
         "loc_limit": DEFAULTS["loc_limit"],
         "notify_loc": DEFAULTS["notify_loc"],
+        "max_agents": DEFAULTS["max_agents"],
     }
     try:
         raw = json.loads(CONFIG_PATH.read_text())
@@ -60,6 +69,12 @@ def load():
     nl = raw.get("notify_loc")
     if isinstance(nl, int) and nl > 0:
         cfg["notify_loc"] = nl
+    # 0 is a meaningful value here (block every subagent), so this one accepts
+    # it where the LOC limits do not. `bool` is an int subclass — reject it, or
+    # a stray `true` in the file silently becomes a budget of one.
+    ma = raw.get("max_agents")
+    if isinstance(ma, int) and not isinstance(ma, bool) and ma >= 0:
+        cfg["max_agents"] = ma
     return cfg
 
 
@@ -74,3 +89,7 @@ def is_enabled(feature):
 
 def loc_limit():
     return load()["loc_limit"]
+
+
+def max_agents():
+    return load()["max_agents"]

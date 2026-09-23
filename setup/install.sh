@@ -10,11 +10,13 @@ set -euo pipefail
 MODULARIO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ANALYZER="$MODULARIO_DIR/scripts/modulario-analyze.py"
 HOOK_SCRIPT="$MODULARIO_DIR/scripts/modulario-hook.sh"
+PRE_HOOK_SCRIPT="$MODULARIO_DIR/scripts/pre_edit_gate.py"
 THRESHOLDS="$MODULARIO_DIR/configs/thresholds.json"
-STATE_FILE="$MODULARIO_DIR/data/state.json"
 TARGET_CONFIG="$MODULARIO_DIR/configs/target.txt"
+CURRENT_TARGET_CONFIG="$MODULARIO_DIR/configs/current-target.txt"
 CODEX_HOOKS="$HOME/.codex/hooks.json"
 STOP_GATE_CMD="python3 $MODULARIO_DIR/scripts/stop_gate.py"
+RESTART_HOOK_CMD="$HOME/.config/claude-autostart/restart-hook.sh"
 
 echo ""
 echo "╔══════════════════════════════════════════════╗"
@@ -71,23 +73,24 @@ if [ ! -d "$TARGET_DIR" ]; then
 fi
 
 echo "$TARGET_DIR" > "$TARGET_CONFIG"
+echo "$TARGET_DIR" > "$CURRENT_TARGET_CONFIG"
+STATE_FILE=$(python3 - "$TARGET_DIR" "$MODULARIO_DIR" <<'PYEOF'
+import hashlib
+import os
+import sys
+
+target, root = sys.argv[1:]
+digest = hashlib.md5(os.path.realpath(target).encode()).hexdigest()[:12]
+print(os.path.join(root, "data", "state", digest + ".json"))
+PYEOF
+)
 echo "✓ Target set to: $TARGET_DIR"
 
 # ─── Claude settings hook ─────────────────────────────────────────────────────
 echo ""
-echo "Where should the Claude PostToolUse hook be installed?"
-echo "  1) Project-specific: $TARGET_DIR/.claude/settings.json"
-echo "  2) Global: $HOME/.claude/settings.json"
-read -rp "Choose [1/2] (default: 1): " CHOICE
-CHOICE="${CHOICE:-1}"
-
-if [ "$CHOICE" = "2" ]; then
-    SETTINGS_FILE="$HOME/.claude/settings.json"
-    mkdir -p "$HOME/.claude"
-else
-    SETTINGS_FILE="$TARGET_DIR/.claude/settings.json"
-    mkdir -p "$TARGET_DIR/.claude"
-fi
+echo "Installing global Claude hooks; registry performs project filtering."
+SETTINGS_FILE="$HOME/.claude/settings.json"
+mkdir -p "$HOME/.claude"
 
 echo ""
 echo "Installing hook into: $SETTINGS_FILE"
@@ -113,7 +116,7 @@ else:
 
 # Build the hook entry
 hook_entry = {
-    "matcher": "Write|Edit|NotebookEdit",
+    "matcher": "Bash|apply_patch|Write|Edit|NotebookEdit",
     "hooks": [
         {
             "type": "command",
@@ -148,7 +151,7 @@ echo ""
 echo "Installing Codex hook into: $CODEX_HOOKS"
 mkdir -p "$(dirname "$CODEX_HOOKS")"
 
-STOP_GATE_CMD="$STOP_GATE_CMD" python3 - "$CODEX_HOOKS" "$HOOK_SCRIPT" <<'PYEOF'
+STOP_GATE_CMD="$STOP_GATE_CMD" RESTART_HOOK_CMD="$RESTART_HOOK_CMD" PRE_HOOK_CMD="python3 $PRE_HOOK_SCRIPT" python3 - "$CODEX_HOOKS" "$HOOK_SCRIPT" <<'PYEOF'
 import json
 import os
 import sys
@@ -166,8 +169,33 @@ else:
     settings = {}
 
 hooks = settings.setdefault("hooks", {})
+pre_hooks = hooks.setdefault("PreToolUse", [])
 post_hooks = hooks.setdefault("PostToolUse", [])
 stop_hooks = hooks.setdefault("Stop", [])
+
+pre_cmd = os.environ["PRE_HOOK_CMD"]
+pre_installed = any(
+    any(h.get("command") == pre_cmd for h in entry.get("hooks", []))
+    for entry in pre_hooks
+)
+
+if pre_installed:
+    print(f"  PreToolUse hook already present in {hooks_file}")
+else:
+    pre_hooks.append({
+        "matcher": "Bash|apply_patch|Write|Edit|NotebookEdit",
+        "hooks": [
+            {
+                "type": "command",
+                "command": pre_cmd,
+                "timeout": 20
+            }
+        ]
+    })
+    with open(hooks_file, "w") as f:
+        json.dump(settings, f, indent=2)
+        f.write("\n")
+    print(f"  ✓ PreToolUse hook added to {hooks_file}")
 
 already_installed = any(
     any(h.get("command") == hook_cmd for h in entry.get("hooks", []))
@@ -178,12 +206,12 @@ if already_installed:
     print(f"  Hook already present in {hooks_file}")
 else:
     post_hooks.append({
-        "matcher": "Write|Edit|NotebookEdit",
+        "matcher": "Bash|apply_patch|Write|Edit|NotebookEdit",
         "hooks": [
             {
                 "type": "command",
                 "command": hook_cmd,
-                "timeout": 20
+                "timeout": 300
             }
         ]
     })
@@ -193,29 +221,79 @@ else:
     print(f"  ✓ Hook added to {hooks_file}")
 
 stop_cmd = os.environ["STOP_GATE_CMD"]
-stop_installed = any(
-    any(h.get("command") == stop_cmd for h in entry.get("hooks", []))
-    for entry in stop_hooks
-)
+restart_cmd = os.environ.get("RESTART_HOOK_CMD", "")
+primary_stop_entry = None
+for entry in stop_hooks:
+    if entry.get("matcher", "") == "":
+        primary_stop_entry = entry
+        break
 
-if stop_installed:
-    print(f"  Stop hook already present in {hooks_file}")
-else:
-    stop_hooks.append({
-        "matcher": "",
-        "hooks": [
-            {
-                "type": "command",
-                "command": stop_cmd,
-                "timeout": 20
-            }
-        ]
+if primary_stop_entry is None:
+    primary_stop_entry = {"matcher": "", "hooks": []}
+    stop_hooks.append(primary_stop_entry)
+
+primary_stop_hooks = primary_stop_entry.setdefault("hooks", [])
+stop_added = False
+restart_added = False
+
+if not any(h.get("command") == stop_cmd for h in primary_stop_hooks):
+    primary_stop_hooks.append({
+        "type": "command",
+        "command": stop_cmd,
+        "timeout": 240
     })
-    with open(hooks_file, "w") as f:
-        json.dump(settings, f, indent=2)
-        f.write("\n")
-    print(f"  ✓ Stop hook added to {hooks_file}")
+    stop_added = True
 
+if restart_cmd and not any(h.get("command") == restart_cmd for h in primary_stop_hooks):
+    primary_stop_hooks.append({
+        "type": "command",
+        "command": restart_cmd,
+        "timeout": 20
+    })
+    restart_added = True
+
+deduped_stop_hooks = []
+for entry in stop_hooks:
+    matcher = entry.get("matcher", "")
+    hooks_list = []
+    for hook in entry.get("hooks", []):
+        cmd = hook.get("command")
+        if matcher == "" and cmd in {stop_cmd, restart_cmd} and entry is not primary_stop_entry:
+            continue
+        hooks_list.append(hook)
+    if hooks_list:
+        deduped_stop_hooks.append({"matcher": matcher, "hooks": hooks_list})
+hooks["Stop"] = deduped_stop_hooks
+
+with open(hooks_file, "w") as f:
+    json.dump(settings, f, indent=2)
+    f.write("\n")
+
+if stop_added:
+    print(f"  ✓ Stop hook added to {hooks_file}")
+else:
+    print(f"  Stop hook already present in {hooks_file}")
+
+if restart_cmd:
+    if restart_added:
+        print(f"  ✓ Restart hook added to {hooks_file}")
+    else:
+        print(f"  Restart hook already present in {hooks_file}")
+
+PYEOF
+
+# Canonical updater: adds Claude Pre/Stop hooks and updates existing matchers/timeouts.
+python3 - "$MODULARIO_DIR" <<'PYEOF'
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+sys.path.insert(0, str(root / "scripts"))
+from cli_common import ensure_codex_hook, ensure_global_hook
+
+ensure_global_hook()
+ensure_codex_hook()
+print("  ✓ Provider-aware global hooks synchronized")
 PYEOF
 
 # ─── Initial analysis pass ───────────────────────────────────────────────────
@@ -233,11 +311,11 @@ echo "╔═══════════════════════�
 echo "║              Setup complete!                 ║"
 echo "╚══════════════════════════════════════════════╝"
 echo ""
-echo "Start the TUI in a separate terminal:"
+echo "Start project picker + TUI:"
 echo ""
-echo "  python3 $MODULARIO_DIR/tui/modulario-tui.py"
+echo "  mod"
 echo ""
-echo "The TUI will update automatically after each Claude file edit."
+echo "Global Claude/Codex hooks route only registered project edits."
 echo ""
 echo "To re-run analysis manually:"
 echo "  python3 $MODULARIO_DIR/scripts/modulario-analyze.py \\"

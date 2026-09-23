@@ -16,67 +16,20 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+from cli_common import BASE_SKIP_DIRS, filter_walk_dirs
 from counters import (count_loc_python, count_loc_js, count_loc_css,
                       count_deps_python, count_deps_js, count_deps_css, assign_status)
 from violations import (collect_graph_data, find_violations,
                         file_in_violations, format_violation_block)
 from import_alerts import build_import_alerts
+from folder_templates import DOC_MARKER, WATCH_MARKER, readme_template, watch_template
 from coupling_tracker import coupling_path, update_coupling, find_strong_pairs, interpret_coupling
+from session_scope import compute_graph_scope, update_session_scope
 import stopgate_config
 
-SKIP_DIRS = {
-    'node_modules', '.git', 'venv', '.venv', '__pycache__',
-    '.next', 'dist', 'build', '.mypy_cache', '.pytest_cache',
-    'coverage', '.tox', '.eggs', 'htmlcov', '.cache',
-    'vendor',
-}
+SKIP_DIRS = BASE_SKIP_DIRS
 
 SUPPORTED_EXTENSIONS = {'.py', '.js', '.ts', '.jsx', '.tsx', '.mjs', '.cjs', '.css'}
-
-
-def _touched_folders_path(output_path):
-    base, _ = os.path.splitext(output_path)
-    return base + '_touched.json'
-
-
-def update_touched_folders(output_path, target, changed_file):
-    """Persistent per-target set of folders that have been edited at least once.
-
-    Read existing set, merge in every ancestor folder of `changed_file` (relative
-    to target, excluding target root itself), persist, return the merged set.
-    Used to gate DOC/WATCH nag emission so untouched folders stay silent.
-    """
-    path = _touched_folders_path(output_path)
-    touched = set()
-    if os.path.exists(path):
-        try:
-            with open(path, 'r', encoding='utf-8') as fh:
-                touched = set(json.load(fh).get('folders', []))
-        except Exception:
-            touched = set()
-
-    if changed_file:
-        try:
-            rel = os.path.relpath(changed_file, target)
-        except ValueError:
-            rel = changed_file
-        rel = rel.replace('\\', '/')
-        if not rel.startswith('..'):
-            parts = rel.split('/')[:-1]
-            acc = []
-            for part in parts:
-                if part in ('', '.', '..'):
-                    continue
-                acc.append(part)
-                touched.add('/'.join(acc))
-            try:
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                with open(path, 'w', encoding='utf-8') as fh:
-                    json.dump({'folders': sorted(touched)}, fh)
-            except OSError:
-                pass
-
-    return touched
 
 
 # ─── Threshold loading ────────────────────────────────────────────────────────
@@ -86,6 +39,7 @@ def load_thresholds(path):
         "loc_bands":  [150, 300, 450, 600, 750],
         "deps_bands": [4, 8, 12, 16, 20],
         "violation_ignore": [],
+        "skip_dirs": [],
         "coupling_window": 30,
         "coupling_min_sessions": 20,
         "coupling_min_count": 5,
@@ -100,7 +54,7 @@ def load_thresholds(path):
             with open(path) as f:
                 loaded = json.load(f)
                 for k in (
-                    "loc_bands", "deps_bands", "violation_ignore",
+                    "loc_bands", "deps_bands", "violation_ignore", "skip_dirs",
                     "coupling_window", "coupling_min_sessions",
                     "coupling_min_count", "coupling_thresholds",
                 ):
@@ -151,11 +105,12 @@ def analyze_file(filepath, thresholds, local_packages=None, files_set=None):
 
 # ─── Directory walk ───────────────────────────────────────────────────────────
 
-def find_local_packages(target_dir):
+def find_local_packages(target_dir, skip_dirs=None):
     packages   = set()
     target_path = Path(target_dir).resolve()
+    skip = list(skip_dirs or [])
     for root, dirs, files in os.walk(target_path):
-        dirs[:] = [d for d in dirs if not d.startswith('.') and d not in SKIP_DIRS]
+        dirs[:] = filter_walk_dirs(root, dirs, target_path, skip)
         if any(f.endswith('.py') for f in files):
             packages.add(Path(root).name)
         for f in files:
@@ -167,11 +122,12 @@ def find_local_packages(target_dir):
 def walk_target(target_dir, thresholds):
     results     = []
     target_path = Path(target_dir).resolve()
-    local_packages = find_local_packages(target_dir)
+    skip = list(thresholds.get('skip_dirs', []) or [])
+    local_packages = find_local_packages(target_dir, skip_dirs=skip)
 
     files_set = set()
     for root, dirs, files in os.walk(target_path):
-        dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS and not d.startswith('.'))
+        dirs[:] = filter_walk_dirs(root, dirs, target_path, skip)
         for filename in files:
             fp = Path(root) / filename
             if fp.suffix.lower() in SUPPORTED_EXTENSIONS:
@@ -181,7 +137,7 @@ def walk_target(target_dir, thresholds):
     all_private  = []
 
     for root, dirs, files in os.walk(target_path):
-        dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS and not d.startswith('.'))
+        dirs[:] = filter_walk_dirs(root, dirs, target_path, skip)
         for filename in sorted(files):
             filepath = Path(root) / filename
             if filepath.suffix.lower() not in SUPPORTED_EXTENSIONS:
@@ -279,7 +235,8 @@ def append_history(history_path, ts, old_files, new_files):
 # ─── Summary for Claude (PostToolUse) ────────────────────────────────────────
 
 def build_claude_summary(state, changed_file, thresholds, history=None,
-                         coupling_data=None, modulario_dir=None, claude_cfg=None):
+                         coupling_data=None, modulario_dir=None, claude_cfg=None,
+                         scope_files=None):
     cc = claude_cfg or {}
     files      = state['files']
     summary    = state['summary']
@@ -294,8 +251,11 @@ def build_claude_summary(state, changed_file, thresholds, history=None,
                 changed_stats = f
                 break
 
+    red_pool = (f for f in files if f['status'] == 'RED')
+    if scope_files:
+        red_pool = (f for f in red_pool if f['path'] in scope_files)
     red_files = sorted(
-        (f for f in files if f['status'] == 'RED'),
+        red_pool,
         key=lambda f: f['loc'] + f['deps'] * 20,
         reverse=True,
     )
@@ -420,7 +380,11 @@ def main():
     parser.add_argument('--target',         required=True, help='Target directory to analyze')
     parser.add_argument('--output',         required=True, help='Path to write state.json')
     parser.add_argument('--thresholds',     help='Path to thresholds.json')
-    parser.add_argument('--changed-file',   default='', help='Path of file just changed')
+    parser.add_argument('--changed-file',   default='', help='Primary file changed by this tool call')
+    parser.add_argument('--changed-files-json', default='',
+                        help='JSON list of every file changed by this tool call')
+    parser.add_argument('--session-id',     default='', help='Current agent session id')
+    parser.add_argument('--provider',       default='unknown', help='Agent provider (claude/codex)')
     parser.add_argument('--print-summary',  action='store_true', help='Print Claude-facing summary')
     parser.add_argument('--check-violations', action='store_true',
                         help='Exit code 2 if changed file is in a violation')
@@ -479,23 +443,45 @@ def main():
     coupling_data = update_coupling(coup_path, history, thresholds)
 
     changed_file = args.changed_file or ''
+    try:
+        changed_files = json.loads(args.changed_files_json) if args.changed_files_json else []
+    except (TypeError, ValueError):
+        changed_files = []
+    if not isinstance(changed_files, list):
+        changed_files = []
+    changed_files = [str(path) for path in changed_files if path]
+    if changed_file and changed_file not in changed_files:
+        changed_files.append(changed_file)
     if args.check_violations and file_in_violations(changed_file, violations):
         print(format_violation_block(violations, changed_file, args.target), file=sys.stderr)
         sys.exit(2)
 
-    touched_folders = update_touched_folders(args.output, args.target, changed_file)
+    touched = update_session_scope(
+        args.output, args.target, changed_files, args.session_id, args.provider
+    )
+    touched_folders = set(touched.get('folders') or [])
+    touched_files = set(touched.get('files') or [])
 
     claude_cfg = stopgate_config.load().get("claude", {})
 
+    # Scope: edited files + their fan-in + fan-out (folder set used to gate
+    # nags, watch.py runs, and red_hotspots so unrelated parts of the repo
+    # do not generate noise on every edit).
+    scope_filter_on = claude_cfg.get("scope_filter", True)
+    scope_files, scope_folders = compute_graph_scope(touched_files, state.get('import_graph', {}))
+    if not scope_filter_on:
+        scope_folders = None
+        scope_files = None
+
     # ── Auto-doc: ensure every folder has a README.md, nag if unfilled ──────
-    TEMPLATE_MARKER = '<!-- modulario:template -->'
+    TEMPLATE_MARKER = DOC_MARKER
     doc_reminders = []
 
     # Walk all directories in the target (not just those with analyzed files)
-    SKIP_DIRS = {'.git', 'node_modules', '__pycache__', '.next', 'dist', 'build', 'venv', '.venv'}
+    DOC_SKIP_DIRS = list(thresholds.get('skip_dirs', []) or [])
     doc_folders = set()
     for root, dirs, _files in os.walk(args.target):
-        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        dirs[:] = filter_walk_dirs(root, dirs, args.target, DOC_SKIP_DIRS)
         rel = os.path.relpath(root, args.target)
         if rel != '.':
             doc_folders.add(rel)
@@ -512,54 +498,7 @@ def main():
                 continue
             # Auto-create template
             folder_name = folder.split('/')[-1]
-            template = f"""{TEMPLATE_MARKER}
-# {folder_name}
-
-## Purpose
-- One or two sentences on what this folder is responsible for.
-- Describe the business/domain concern, not the technical details.
-
-## Owns
-- List the main responsibilities this folder **does own**.
-- Each item should be something that changes when this folder changes.
-
-## Does NOT own
-- List responsibilities that live elsewhere to prevent scope creep.
-- Link to the other folder/module if relevant.
-
-## Key Files
-- `example.js`: short description of what this file is and when it runs.
-
-## Data & External Dependencies
-- What data models or types this area works with.
-- What external services or libraries it directly touches.
-- Any important shared modules it depends on.
-
-## How It Works (Flow)
-1. Brief step-by-step of the main flow.
-2. Optional secondary flows if they are important.
-
-## Invariants & Constraints
-- Rules that **must** remain true.
-- Performance or security constraints.
-- "Never do X" type rules that are easy to forget.
-
-## Extension Points
-- How to add a new feature in this area.
-- What file to start from when extending behavior.
-
-## Known Issues, Recurring Bugs, and Pain Points (and How to Prevent Them)
-
-- **Short name of issue** — `ACTIVE` or `RESOLVED`
-  - When it happens: one line about the situation/context.
-  - Symptom: what you see break.
-  - Root cause: the underlying mistake or assumption.
-  - Prevention/fix: the rule, pattern, or helper to use so it doesn't come back.
-  - Status: `ACTIVE` = still a risk, `RESOLVED` = was an issue, now fixed (keep for history).
-
-## Recent Changes
-- {datetime.now().strftime('%Y-%m-%d')}: Initial doc created.
-"""
+            template = readme_template(folder_name, datetime.now().strftime('%Y-%m-%d'))
             try:
                 with open(readme, 'w', encoding='utf-8') as fh:
                     fh.write(template)
@@ -576,8 +515,10 @@ def main():
             except OSError:
                 pass
 
-    # Gate nags to touched folders only (persistent, per target)
-    unfilled = [f for f in unfilled if f in touched_folders]
+    # Gate nags: scope (touched ∪ fan-in ∪ fan-out folders) when scope_filter
+    # is on, else fall back to touched_folders for the legacy behavior.
+    nag_gate = scope_folders if scope_folders is not None else touched_folders
+    unfilled = [f for f in unfilled if f in nag_gate]
 
     if not claude_cfg.get("doc_nag", True):
         unfilled = []
@@ -609,7 +550,6 @@ def main():
             )
 
     # ── Auto-watch: ensure every folder has a watch.py, nag if unfilled ─────
-    WATCH_MARKER = '# modulario:template'
     watch_reminders = []
     unfilled_watches = []
     for folder in sorted(doc_folders):
@@ -623,47 +563,7 @@ def main():
             folder_name = folder.split('/')[-1]
             depth = len(folder.split('/'))
             parents = '/'.join(['..'] * depth)
-            template = f'''{WATCH_MARKER}
-"""watch.py — health checks for {folder_name}
-
-Auto-generated by Modulario. Fill in the stub functions below with real
-checks for this folder. Remove the marker comment on line 1 when done.
-Runs via `mod watch` — exit 0 = PASS, exit non-zero = FAIL.
-"""
-import sys
-import os
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '{parents}'))
-
-
-# ── Import checks ──────────────────────────────
-# Verify key modules in this folder can be imported without error.
-def check_imports():
-    pass  # e.g. from {folder_name} import main_module
-
-
-# ── Public API checks ─────────────────────────
-# Verify expected functions/classes exist and are callable.
-def check_public_api():
-    pass  # e.g. assert callable(main_module.some_function)
-
-
-# ── Invariant checks ──────────────────────────
-# Verify structural rules that must remain true for this folder.
-def check_invariants():
-    pass  # e.g. assert config file exists, assert no forbidden patterns
-
-
-# ── Run all checks ────────────────────────────
-if __name__ == '__main__':
-    checks = [check_imports, check_public_api, check_invariants]
-    for fn in checks:
-        try:
-            fn()
-        except Exception as e:
-            print(f"FAIL {{fn.__name__}}: {{e}}", file=sys.stderr)
-            sys.exit(1)
-'''
+            template = watch_template(folder_name, parents)
             try:
                 with open(watch_file, 'w', encoding='utf-8') as fh:
                     fh.write(template)
@@ -679,7 +579,7 @@ if __name__ == '__main__':
             except OSError:
                 pass
 
-    unfilled_watches = [f for f in unfilled_watches if f in touched_folders]
+    unfilled_watches = [f for f in unfilled_watches if f in nag_gate]
     if not claude_cfg.get("watch_nag", True):
         unfilled_watches = []
 
@@ -708,11 +608,6 @@ if __name__ == '__main__':
             )
 
     if args.print_summary and claude_cfg.get("summary_block", True):
-        text = build_claude_summary(
-            state, changed_file, thresholds, history, coupling_data,
-            modulario_dir=Path(__file__).resolve().parent.parent,
-            claude_cfg=claude_cfg,
-        )
         alerts = []
         if claude_cfg.get("threshold_alerts", True):
             alerts += build_threshold_alerts(
@@ -723,14 +618,45 @@ if __name__ == '__main__':
             alerts += build_import_alerts(state, changed_file, args.target)
         alerts += doc_reminders
         alerts += watch_reminders
-        if alerts:
-            text = text + "\n" + "\n".join(alerts)
-        print(json.dumps({
+
+        # Look up the changed file's status for the quiet-when-clean check.
+        changed_stats = None
+        if changed_file:
+            for f in state['files']:
+                if f['abs_path'] == changed_file or f['path'].endswith(changed_file):
+                    changed_stats = f
+                    break
+
+        quiet = claude_cfg.get("quiet_when_clean", True)
+        # Clean = nothing actionable to surface. Either the file is in the
+        # target and at GREEN/LIME, OR the file is outside the target (so
+        # there is nothing project-relevant to say about it).
+        is_clean = not alerts and (
+            changed_stats is None
+            or changed_stats.get('status') in ('GREEN', 'LIME')
+        )
+
+        if quiet and is_clean:
+            text = ''
+        else:
+            text = build_claude_summary(
+                state, changed_file, thresholds, history, coupling_data,
+                modulario_dir=Path(__file__).resolve().parent.parent,
+                claude_cfg=claude_cfg,
+                scope_files=scope_files,
+            )
+            if alerts:
+                text = text + "\n" + "\n".join(alerts)
+
+        out = {
+            "_scope_folders": sorted(scope_folders) if scope_folders is not None else None,
             "hookSpecificOutput": {
                 "hookEventName":    "PostToolUse",
                 "additionalContext": text,
             }
-        }))
+        }
+        # Watch runner consumes/removes `_scope_folders` before returning hook JSON.
+        print(json.dumps(out))
     else:
         print(
             f"[Modulario] {summary['total']} files — "

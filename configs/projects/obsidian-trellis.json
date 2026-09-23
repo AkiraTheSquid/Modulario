@@ -1,0 +1,7 @@
+{
+  "name": "obsidian-trellis",
+  "display_name": "Obsidian Trellis",
+  "target_dir": "/home/stellar-thread/Applications/trellis-obsidian",
+  "enabled": true,
+  "priority": 10
+}

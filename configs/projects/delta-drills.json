@@ -1,0 +1,7 @@
+{
+  "name": "delta-drills",
+  "display_name": "Delta Drills",
+  "target_dir": "/home/stellar-thread/Applications/Delta-Drills-Local",
+  "enabled": true,
+  "priority": 20
+}
